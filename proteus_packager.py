@@ -32,6 +32,7 @@ import substance_painter.project
 import substance_painter.textureset
 import substance_painter.export
 import substance_painter.event
+import substance_painter.resource
 
 try:
     import substance_painter.layerstack as _ls
@@ -168,10 +169,16 @@ class ProteusPackagerPlugin:
         # Export Preset
         preset_row = QtWidgets.QHBoxLayout()
         preset_row.addWidget(QtWidgets.QLabel("Export Preset"))
-        self._export_preset_edit = QtWidgets.QLineEdit(self._export_preset)
-        self._export_preset_edit.setPlaceholderText("SP export preset name (exact match)")
-        preset_row.addWidget(self._export_preset_edit)
+        self._export_preset_combo = QtWidgets.QComboBox()
+        self._export_preset_combo.setEditable(True)  # allow typing if list is empty
+        preset_row.addWidget(self._export_preset_combo)
+        refresh_btn = QtWidgets.QPushButton("↻")
+        refresh_btn.setFixedWidth(28)
+        refresh_btn.setToolTip("Refresh preset list from SP")
+        refresh_btn.clicked.connect(self._refresh_export_presets)
+        preset_row.addWidget(refresh_btn)
         root.addLayout(preset_row)
+        self._refresh_export_presets(select=self._export_preset)
 
         # Material Game Paths
         mat_label_row = QtWidgets.QHBoxLayout()
@@ -250,6 +257,21 @@ class ProteusPackagerPlugin:
     def _clear_log(self):
         self._log_edit.clear()
 
+    def _refresh_export_presets(self, select: str = ""):
+        names = _list_export_preset_names()
+        current = select or self._export_preset_combo.currentText()
+        self._export_preset_combo.blockSignals(True)
+        self._export_preset_combo.clear()
+        for name in names:
+            self._export_preset_combo.addItem(name)
+        # Restore selection; fall back to typing the saved value if not in list
+        idx = self._export_preset_combo.findText(current)
+        if idx >= 0:
+            self._export_preset_combo.setCurrentIndex(idx)
+        elif current:
+            self._export_preset_combo.setEditText(current)
+        self._export_preset_combo.blockSignals(False)
+
     def _log(self, msg: str):
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         QtCore.QMetaObject.invokeMethod(
@@ -266,6 +288,14 @@ class ProteusPackagerPlugin:
             substance_painter.event.ExportTexturesEnded,
             self._on_sp_export_finished,
         )
+        for event_type in (
+            substance_painter.event.ProjectOpened,
+            substance_painter.event.ProjectCreated,
+        ):
+            substance_painter.event.DISPATCHER.connect(event_type, self._on_project_opened)
+
+    def _on_project_opened(self, _ev=None):
+        self._refresh_export_presets()
 
     def _on_sp_export_finished(self, _res):
         self._read_ui_settings()
@@ -287,7 +317,7 @@ class ProteusPackagerPlugin:
     def _read_ui_settings(self):
         self._author = self._author_edit.text().strip()
         self._output_dir = self._output_edit.text().strip()
-        self._export_preset = self._export_preset_edit.text().strip()
+        self._export_preset = self._export_preset_combo.currentText().strip()
         self._material_paths = self._material_edit.toPlainText().strip()
         self._mutually_exclusive = self._mutex_check.isChecked()
         self._auto_export = self._auto_check.isChecked()
@@ -472,6 +502,11 @@ class ProteusPackagerPlugin:
             substance_painter.event.ExportTexturesEnded,
             self._on_sp_export_finished,
         )
+        for event_type in (
+            substance_painter.event.ProjectOpened,
+            substance_painter.event.ProjectCreated,
+        ):
+            substance_painter.event.DISPATCHER.disconnect(event_type, self._on_project_opened)
         if self._widget:
             substance_painter.ui.delete_ui_element(self._widget)
             self._widget = None
@@ -610,6 +645,32 @@ def _node_children(node) -> list:
 
 
 # ── Misc helpers ──────────────────────────────────────────────────────────────
+
+def _list_export_preset_names() -> list[str]:
+    """Return sorted list of SP export preset names, trying several API forms."""
+    import substance_painter.resource as spres
+    try:
+        # SP 9.x: list_resources accepts a Usage enum
+        resources = spres.list_resources(spres.Usage.EXPORT)
+        return sorted(r.identifier().name for r in resources)
+    except Exception:
+        pass
+    try:
+        # Older API: search with usage keyword
+        resources = spres.search("", usage=spres.Usage.EXPORT)
+        return sorted(r.identifier().name for r in resources)
+    except Exception:
+        pass
+    try:
+        # Fallback: iterate all resources and filter by type string
+        all_res = spres.list_resources()
+        return sorted(
+            r.identifier().name for r in all_res
+            if "export" in str(getattr(r, "type", lambda: "")()).lower()
+        )
+    except Exception:
+        return []
+
 
 def _split_csv(text: str) -> list[str]:
     return [x.strip() for x in text.split(",") if x.strip()]
