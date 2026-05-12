@@ -41,7 +41,10 @@ except ImportError:
     _ls = None
     _HAS_LAYERSTACK = False
 
-from PySide2 import QtWidgets, QtCore
+try:
+    from PySide6 import QtWidgets, QtCore
+except ImportError:
+    from PySide2 import QtWidgets, QtCore
 
 
 PLUGIN_NAME = "Proteus Packager"
@@ -274,12 +277,20 @@ class ProteusPackagerPlugin:
 
     def _log(self, msg: str):
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        QtCore.QMetaObject.invokeMethod(
-            self._log_edit,
-            "appendPlainText",
-            QtCore.Qt.QueuedConnection,
-            QtCore.Q_ARG(str, f"[{ts}] {msg}"),
-        )
+        line = f"[{ts}] {msg}"
+        # Append safely from any thread; connection type name differs between PySide versions.
+        try:
+            conn = QtCore.Qt.ConnectionType.QueuedConnection  # PySide6
+        except AttributeError:
+            conn = QtCore.Qt.QueuedConnection                 # PySide2
+        try:
+            QtCore.QMetaObject.invokeMethod(
+                self._log_edit, "appendPlainText", conn,
+                QtCore.Q_ARG(str, line),
+            )
+        except TypeError:
+            # PySide6 dropped Q_ARG in some builds; call directly on main thread
+            self._log_edit.appendPlainText(line)
 
     # ── Events ────────────────────────────────────────────────────────────────
 
