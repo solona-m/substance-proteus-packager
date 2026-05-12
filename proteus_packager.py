@@ -15,7 +15,9 @@ When "Export PMP" is clicked the plugin:
   4. Packages everything into <ProjectName>.pmp.
 
 Install: copy this file to
-  %LOCALAPPDATA%\\Adobe\\Adobe Substance 3D Painter\\plugins\\
+  %USERPROFILE%\Documents\Adobe\Adobe Substance 3D Painter\python
+
+Copy the Proteus.spexp file to %USERPROFILE%\Documents\Adobe\Adobe Substance 3D Painter\assets\export-presets
 """
 
 import os
