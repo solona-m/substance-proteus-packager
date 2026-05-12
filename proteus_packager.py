@@ -261,18 +261,21 @@ class ProteusPackagerPlugin:
         self._log_edit.clear()
 
     def _refresh_export_presets(self, select: str = ""):
-        names = _list_export_preset_names()
-        current = select or self._export_preset_combo.currentText()
+        """Repopulate the export preset combo. select is a saved resource URL."""
+        presets = _list_export_presets()
+        current_url = select or self._export_preset_combo.currentData() or ""
         self._export_preset_combo.blockSignals(True)
         self._export_preset_combo.clear()
-        for name in names:
-            self._export_preset_combo.addItem(name)
-        # Restore selection; fall back to typing the saved value if not in list
-        idx = self._export_preset_combo.findText(current)
+        for display_name, url in presets:
+            self._export_preset_combo.addItem(display_name, userData=url)
+        # Restore by URL; fall back to text match; fall back to editable text
+        idx = self._export_preset_combo.findData(current_url)
         if idx >= 0:
             self._export_preset_combo.setCurrentIndex(idx)
-        elif current:
-            self._export_preset_combo.setEditText(current)
+        elif current_url:
+            self._export_preset_combo.setEditText(current_url)
+        elif not presets:
+            self._export_preset_combo.setPlaceholderText("No presets found — type URL manually")
         self._export_preset_combo.blockSignals(False)
 
     def _log(self, msg: str):
@@ -328,7 +331,9 @@ class ProteusPackagerPlugin:
     def _read_ui_settings(self):
         self._author = self._author_edit.text().strip()
         self._output_dir = self._output_edit.text().strip()
-        self._export_preset = self._export_preset_combo.currentText().strip()
+        # Prefer the stored URL (item data); fall back to typed text for manual entry
+        self._export_preset = (self._export_preset_combo.currentData()
+                               or self._export_preset_combo.currentText().strip())
         self._material_paths = self._material_edit.toPlainText().strip()
         self._mutually_exclusive = self._mutex_check.isChecked()
         self._auto_export = self._auto_check.isChecked()
@@ -478,13 +483,14 @@ class ProteusPackagerPlugin:
             "exportShaderParams": False,
             "exportPath": output_dir,
             "exportList": [{"rootPath": ts} for ts in ts_names],
-            "defaultExportPreset": self._export_preset,
+            "defaultExportPreset": self._export_preset,  # must be a resource:// URL
         }
         try:
             result = substance_painter.export.export_project_textures(config)
             files: list[str] = []
-            for ts_files in result.textures.values():
-                files.extend(ts_files)
+            # textures is Dict[Tuple[ts_name, stack_name], List[str]]
+            for file_list in result.textures.values():
+                files.extend(file_list)
             return files
         except Exception as exc:
             self._log(f"  SP export error: {exc}")
@@ -657,28 +663,25 @@ def _node_children(node) -> list:
 
 # ── Misc helpers ──────────────────────────────────────────────────────────────
 
-def _list_export_preset_names() -> list[str]:
-    """Return sorted list of SP export preset names, trying several API forms."""
+def _list_export_presets() -> list[tuple[str, str]]:
+    """
+    Return sorted list of (display_name, resource_url) for all SP export presets.
+    Uses resource.search() + Type.EXPORT filter — the actual SP Python API.
+    """
     import substance_painter.resource as spres
     try:
-        # SP 9.x: list_resources accepts a Usage enum
-        resources = spres.list_resources(spres.Usage.EXPORT)
-        return sorted(r.identifier().name for r in resources)
-    except Exception:
-        pass
-    try:
-        # Older API: search with usage keyword
-        resources = spres.search("", usage=spres.Usage.EXPORT)
-        return sorted(r.identifier().name for r in resources)
-    except Exception:
-        pass
-    try:
-        # Fallback: iterate all resources and filter by type string
-        all_res = spres.list_resources()
-        return sorted(
-            r.identifier().name for r in all_res
-            if "export" in str(getattr(r, "type", lambda: "")()).lower()
-        )
+        all_res = spres.search(spres.StandardQuery.ALL_RESOURCES)
+        presets = []
+        for r in all_res:
+            try:
+                if r.type() != spres.Type.EXPORT:
+                    continue
+                name = r.gui_name() or r.identifier().name
+                url = r.identifier().url()
+                presets.append((name, url))
+            except Exception:
+                continue
+        return sorted(presets, key=lambda t: t[0].lower())
     except Exception:
         return []
 
