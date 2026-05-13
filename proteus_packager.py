@@ -81,6 +81,7 @@ class ProteusPackagerPlugin:
         self._export_preset = ""
         self._mutually_exclusive = True
         self._auto_export = False
+        self._source_metadata_path = ""
         self._material_paths = _BIBO_PLUS_PATHS
         self._suffixes = {
             "Diffuse": ["_d"],
@@ -106,6 +107,7 @@ class ProteusPackagerPlugin:
         self._export_preset = g.get("ExportPreset", "")
         self._mutually_exclusive = cfg.getboolean("General", "MutuallyExclusive", fallback=True)
         self._auto_export = cfg.getboolean("General", "AutoExport", fallback=False)
+        self._source_metadata_path = g.get("SourceMetadata", "")
 
         s = cfg["Suffixes"] if "Suffixes" in cfg else {}
         self._suffixes = {
@@ -132,6 +134,7 @@ class ProteusPackagerPlugin:
             "ExportPreset": self._export_preset,
             "MutuallyExclusive": str(self._mutually_exclusive),
             "AutoExport": str(self._auto_export),
+            "SourceMetadata": self._source_metadata_path,
         }
         cfg["Suffixes"] = {k: ",".join(v) for k, v in self._suffixes.items()}
         cfg["MaterialPaths"] = {"Default": self._material_paths.replace("\n", "\\n")}
@@ -168,6 +171,18 @@ class ProteusPackagerPlugin:
         browse_btn.clicked.connect(self._browse_output)
         out_row.addWidget(browse_btn)
         root.addLayout(out_row)
+
+        # Source Metadata
+        src_meta_row = QtWidgets.QHBoxLayout()
+        src_meta_row.addWidget(QtWidgets.QLabel("Copy Colorset From"))
+        self._source_meta_edit = QtWidgets.QLineEdit(self._source_metadata_path)
+        self._source_meta_edit.setPlaceholderText("Optional — existing metadata.json")
+        src_meta_row.addWidget(self._source_meta_edit)
+        src_meta_browse_btn = QtWidgets.QPushButton("...")
+        src_meta_browse_btn.setFixedWidth(30)
+        src_meta_browse_btn.clicked.connect(self._browse_source_metadata)
+        src_meta_row.addWidget(src_meta_browse_btn)
+        root.addLayout(src_meta_row)
 
         # Export Preset
         preset_row = QtWidgets.QHBoxLayout()
@@ -249,6 +264,7 @@ class ProteusPackagerPlugin:
     def _connect_ui_autosave(self):
         self._author_edit.editingFinished.connect(self._read_ui_settings)
         self._output_edit.editingFinished.connect(self._read_ui_settings)
+        self._source_meta_edit.editingFinished.connect(self._read_ui_settings)
         self._export_preset_combo.currentIndexChanged.connect(self._read_ui_settings)
         self._mutex_check.stateChanged.connect(self._read_ui_settings)
         self._auto_check.stateChanged.connect(self._read_ui_settings)
@@ -261,6 +277,17 @@ class ProteusPackagerPlugin:
         )
         if d:
             self._output_edit.setText(d)
+
+    def _browse_source_metadata(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self._widget,
+            "Select existing metadata.json",
+            self._source_meta_edit.text() or self._output_edit.text(),
+            "Metadata JSON (metadata.json);;JSON Files (*.json);;All Files (*)",
+        )
+        if path:
+            self._source_meta_edit.setText(path)
+            self._read_ui_settings()
 
     def _load_mat_preset(self):
         name = self._mat_preset_combo.currentText()
@@ -342,6 +369,7 @@ class ProteusPackagerPlugin:
     def _read_ui_settings(self):
         self._author = self._author_edit.text().strip()
         self._output_dir = self._output_edit.text().strip()
+        self._source_metadata_path = self._source_meta_edit.text().strip()
         # Prefer the stored URL (item data); fall back to typed text for manual entry
         self._export_preset = (self._export_preset_combo.currentData()
                                or self._export_preset_combo.currentText().strip())
@@ -383,6 +411,22 @@ class ProteusPackagerPlugin:
         self._log("Groups: " + ", ".join(
             f"{g}({', '.join(opts)})" for g, opts in structure.items()
         ))
+
+        # Load ColorTableRows from a previously-built metadata.json if provided
+        existing_color_rows: dict[tuple[str, str], list] = {}
+        if self._source_metadata_path and os.path.exists(self._source_metadata_path):
+            try:
+                with open(self._source_metadata_path, encoding="utf-8") as _f:
+                    _src = json.load(_f)
+                for _og in _src.get("OptionGroups", []):
+                    _gname = _og.get("PenumbraGroupName", "")
+                    for _opt in _og.get("Options", []):
+                        _rows = _opt.get("ColorTableRows")
+                        if _rows is not None:
+                            existing_color_rows[(_gname, _opt.get("Name", ""))] = _rows
+                self._log(f"Source metadata: {len(existing_color_rows)} ColorTableRow entries loaded.")
+            except Exception as _exc:
+                self._log(f"Warning: could not read source metadata — {_exc}")
 
         # 2. Build temp directories
         tmpdir = tempfile.mkdtemp(prefix="proteus_pmp_")
@@ -438,7 +482,10 @@ class ProteusPackagerPlugin:
                     options_meta.append({
                         "Name": option,
                         "Overlays": [overlay],
-                        "ColorTableRows": [{"Row": 16, "SubRowA": {"Diffuse": "#FFFFFF"}}],
+                        "ColorTableRows": existing_color_rows.get(
+                            (group, option),
+                            [{"Row": 16, "SubRowA": {"Diffuse": "#FFFFFF"}}],
+                        ),
                     })
 
                 option_groups_meta.append({
