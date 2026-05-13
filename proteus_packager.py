@@ -1,4 +1,4 @@
-"""
+r"""
 Proteus Packager — Substance Painter plugin.
 
 Builds a Penumbra-compatible .pmp sidecar with a Proteus/metadata.json
@@ -464,7 +464,7 @@ class ProteusPackagerPlugin:
                         continue
 
                     # Copy recognised files into the Proteus sidecar tree
-                    rel_subdir = f"{group}/{option}"
+                    rel_subdir = os.path.join(group, option)
                     abs_subdir = os.path.join(proteus_dir, group, option)
                     os.makedirs(abs_subdir, exist_ok=True)
 
@@ -478,8 +478,8 @@ class ProteusPackagerPlugin:
                             continue
                         fname = Path(fpath).name
                         shutil.copy2(fpath, os.path.join(abs_subdir, fname))
-                        overlay[tex_type] = f"{rel_subdir}/{fname}"
-                        self._log(f"  {tex_type}: {rel_subdir}/{fname}")
+                        overlay[tex_type] = os.path.join(rel_subdir, fname)
+                        self._log(f"  {tex_type}: {os.path.join(rel_subdir, fname)}")
 
                     options_meta.append({
                         "Name": option,
