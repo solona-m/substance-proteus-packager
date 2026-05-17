@@ -3,7 +3,7 @@
 A [Substance Painter](https://www.adobe.com/products/substance3d-painter.html) plugin that builds a Penumbra-compatible `.pmp` modpack with a [Proteus](https://github.com/solona-m/proteus) sidecar by reading your layer stack folder structure.
 
 
-A [Rue Mannequin](https://github.com/solona-m/substance-proteus-packager/blob/main/Rue%20Mannequin.fbx) is an fbx use can use for creating a substance painter project to paint on for bibo-uv bodies if you're doing skin overlays. The overlays will work on all bibo-based bodies. If you prefer to paint on Neolithe, there's a mannequin in the neolithe download folder. 
+A [Rue Mannequin](https://github.com/solona-m/substance-proteus-packager/blob/main/Rue%20Mannequin.fbx) is an fbx use can use for creating a substance painter project to paint on for bibo-uv bodies if you're doing skin overlays. The overlays will work on all bibo-based bodies. If you prefer to paint on Neolithe, there's a mannequin in the [neolithe download folder](https://neolithe.carrd.co/#download)
 
 After you create your textures, it's recommended to adjust your default colorsets using the /proteus ui in game. Then reexport your mod from penumbra. You can also point the substance plugin to your metadata.json in the penumbra mod directory to load any colorset values before substance packs the mod.
 
