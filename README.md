@@ -2,11 +2,16 @@
 
 A [Substance Painter](https://www.adobe.com/products/substance3d-painter.html) plugin that builds a Penumbra-compatible `.pmp` modpack with a [Proteus](https://github.com/solona-m/proteus) sidecar by reading your layer stack folder structure.
 
+
+A [Rue Mannequin](https://github.com/solona-m/substance-proteus-packager/blob/main/Rue%20Mannequin.fbx) is an fbx use can use for creating a substance painter project to paint on for bibo-uv bodies if you're doing skin overlays. The overlays will work on all bibo-based bodies. If you prefer to paint on Neolithe, there's a mannequin in the neolithe download folder. 
+
+After you create your textures, it's recommended to adjust your default colorsets using the /proteus ui in game. Then reexport your mod from penumbra. You can also point the substance plugin to your metadata.json in the penumbra mod directory to load any colorset values before substance packs the mod.
+
 ---
 
 ## How it works
 
-The plugin reads the **layer folder hierarchy** inside your texture sets:
+The plugin reads the **layer folder hierarchy** inside your texture sets in substance:
 
 ```
 Texture Set (e.g. "Body")
@@ -92,12 +97,13 @@ Exported filenames are matched to overlay types by suffix (longest match wins). 
 
 For other templates you can configure custom suffixes (e.g. `_d`, `_n`, `_id`, `_m`).
 
-### Bibo+ preset material paths
+### Bibo+ preset material paths for all races
 
 ```
 chara/human/c0201/obj/body/b0001/material/v0001/mt_c0201b0001_bibo.mtrl
 chara/human/c0401/obj/body/b0001/material/v0001/mt_c0401b0001_bibo.mtrl
 chara/human/c1401/obj/body/b0001/material/v0001/mt_c1401b0001_bibo.mtrl
+chara/human/c1401/obj/body/b0101/material/v0001/mt_c1401b0101_bibo.mtrl
 chara/human/c1801/obj/body/b0001/material/v0001/mt_c1801b0001_bibo.mtrl
 chara/human/c1601/obj/body/b0001/material/v0001/mt_c1601b0001_bibo.mtrl
 ```
