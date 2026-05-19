@@ -22,7 +22,9 @@ import os
 import re
 import json
 import shutil
+import struct
 import tempfile
+import zlib
 import configparser
 from datetime import datetime
 from pathlib import Path
@@ -54,6 +56,7 @@ _BIBO_PLUS_PATHS = "\n".join([
     "chara/human/c0201/obj/body/b0001/material/v0001/mt_c0201b0001_bibo.mtrl",
     "chara/human/c0401/obj/body/b0001/material/v0001/mt_c0401b0001_bibo.mtrl",
     "chara/human/c1401/obj/body/b0001/material/v0001/mt_c1401b0001_bibo.mtrl",
+    "chara/human/c1401/obj/body/b0001/material/v0001/mt_c1401b0101_bibo.mtrl",
     "chara/human/c1801/obj/body/b0001/material/v0001/mt_c1801b0001_bibo.mtrl",
     "chara/human/c1601/obj/body/b0001/material/v0001/mt_c1601b0001_bibo.mtrl",
 ])
@@ -596,7 +599,8 @@ class ProteusPackagerPlugin:
                             self._log(f"  Skipping unrecognised: {Path(fpath).name}")
                             continue
                         fname = Path(fpath).name
-                        shutil.copy2(fpath, os.path.join(abs_subdir, fname))
+                        _png_copy_stamped(fpath, os.path.join(abs_subdir, fname),
+                                          rel_subdir)
                         overlay[tex_type] = f"{rel_subdir}/{fname}"
                         self._log(f"  {tex_type}: {rel_subdir}/{fname}")
 
@@ -1052,6 +1056,31 @@ def _load_colorset_map(path: str, log=None) -> dict:
             cmap[(g, name)] = rows
             cmap.setdefault((None, name), rows)
     return cmap
+
+
+_PNG_SIG  = b"\x89PNG\r\n\x1a\n"
+_PNG_IEND = b"\x00\x00\x00\x00IEND\xae\x42\x60\x82"
+
+
+def _png_copy_stamped(src: str, dst: str, label: str) -> None:
+    """Copy a PNG to dst, injecting a tEXt chunk so identical pixel data
+    produces distinct files — preventing Penumbra's auto-deduplicate from
+    collapsing shared index textures across options."""
+    with open(src, "rb") as f:
+        data = f.read()
+
+    if not data.startswith(_PNG_SIG) or not data.endswith(_PNG_IEND):
+        shutil.copy2(src, dst)
+        return
+
+    chunk_data = b"Proteus-Option\x00" + label.encode("latin-1", errors="replace")
+    crc = zlib.crc32(b"tEXt" + chunk_data) & 0xFFFFFFFF
+    text_chunk = struct.pack(">I", len(chunk_data)) + b"tEXt" + chunk_data + struct.pack(">I", crc)
+
+    with open(dst, "wb") as f:
+        f.write(data[:-12])   # everything before IEND
+        f.write(text_chunk)
+        f.write(_PNG_IEND)
 
 
 def _write_json(path: str, data):
