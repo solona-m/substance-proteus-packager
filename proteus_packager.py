@@ -78,6 +78,8 @@ class ProteusPackagerPlugin:
         self._widget = None
         self._author = ""
         self._output_dir = ""
+        self._existing_pmp = ""
+        self._colorset_meta = ""
         self._export_preset = ""
         self._mutually_exclusive = True
         self._auto_export = False
@@ -97,12 +99,14 @@ class ProteusPackagerPlugin:
     # ── Settings ──────────────────────────────────────────────────────────────
 
     def _load_settings(self):
-        cfg = configparser.ConfigParser()
+        cfg = configparser.RawConfigParser()
         cfg.read(_INI_FILE, encoding="utf-8")
 
         g = cfg["General"] if "General" in cfg else {}
         self._author = g.get("Author", "")
         self._output_dir = g.get("OutputDir", "")
+        self._existing_pmp = g.get("ExistingPmp", "")
+        self._colorset_meta = g.get("ColorsetMeta", "")
         self._export_preset = g.get("ExportPreset", "")
         self._mutually_exclusive = cfg.getboolean("General", "MutuallyExclusive", fallback=True)
         self._auto_export = cfg.getboolean("General", "AutoExport", fallback=False)
@@ -125,10 +129,12 @@ class ProteusPackagerPlugin:
                     self._presets[k] = v.replace("\\n", "\n")
 
     def _save_settings(self):
-        cfg = configparser.ConfigParser()
+        cfg = configparser.RawConfigParser()
         cfg["General"] = {
             "Author": self._author,
             "OutputDir": self._output_dir,
+            "ExistingPmp": self._existing_pmp,
+            "ColorsetMeta": self._colorset_meta,
             "ExportPreset": self._export_preset,
             "MutuallyExclusive": str(self._mutually_exclusive),
             "AutoExport": str(self._auto_export),
@@ -168,6 +174,37 @@ class ProteusPackagerPlugin:
         browse_btn.clicked.connect(self._browse_output)
         out_row.addWidget(browse_btn)
         root.addLayout(out_row)
+
+        # Existing PMP (merge target)
+        pmp_row = QtWidgets.QHBoxLayout()
+        pmp_row.addWidget(QtWidgets.QLabel("Existing PMP"))
+        self._existing_pmp_edit = QtWidgets.QLineEdit(self._existing_pmp)
+        self._existing_pmp_edit.setToolTip(
+            "Leave blank to build a new pack. If set, new options are merged "
+            "into this pack and it is overwritten in place."
+        )
+        pmp_row.addWidget(self._existing_pmp_edit)
+        pmp_browse_btn = QtWidgets.QPushButton("...")
+        pmp_browse_btn.setFixedWidth(30)
+        pmp_browse_btn.clicked.connect(self._browse_existing_pmp)
+        pmp_row.addWidget(pmp_browse_btn)
+        root.addLayout(pmp_row)
+
+        # Colorset metadata.json (pull ColorTableRows from an existing pack)
+        cset_row = QtWidgets.QHBoxLayout()
+        cset_row.addWidget(QtWidgets.QLabel("Colorset metadata"))
+        self._colorset_meta_edit = QtWidgets.QLineEdit(self._colorset_meta)
+        self._colorset_meta_edit.setToolTip(
+            "Optional. Select an existing Proteus metadata.json; exported "
+            "options reuse its ColorTableRows (matched by option name) "
+            "instead of the default white colorset."
+        )
+        cset_row.addWidget(self._colorset_meta_edit)
+        cset_browse_btn = QtWidgets.QPushButton("...")
+        cset_browse_btn.setFixedWidth(30)
+        cset_browse_btn.clicked.connect(self._browse_colorset_meta)
+        cset_row.addWidget(cset_browse_btn)
+        root.addLayout(cset_row)
 
         # Export Preset
         preset_row = QtWidgets.QHBoxLayout()
@@ -244,6 +281,18 @@ class ProteusPackagerPlugin:
         root.addWidget(self._log_edit)
 
         substance_painter.ui.add_dock_widget(self._widget)
+        self._connect_ui_autosave()
+
+    def _connect_ui_autosave(self):
+        self._author_edit.editingFinished.connect(self._read_ui_settings)
+        self._output_edit.editingFinished.connect(self._read_ui_settings)
+        self._existing_pmp_edit.editingFinished.connect(self._read_ui_settings)
+        self._colorset_meta_edit.editingFinished.connect(self._read_ui_settings)
+        self._export_preset_combo.currentIndexChanged.connect(self._read_ui_settings)
+        self._mutex_check.stateChanged.connect(self._read_ui_settings)
+        self._auto_check.stateChanged.connect(self._read_ui_settings)
+        for edit in self._suffix_edits.values():
+            edit.editingFinished.connect(self._read_ui_settings)
 
     def _browse_output(self):
         d = QtWidgets.QFileDialog.getExistingDirectory(
@@ -251,6 +300,24 @@ class ProteusPackagerPlugin:
         )
         if d:
             self._output_edit.setText(d)
+
+    def _browse_existing_pmp(self):
+        f, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self._widget, "Select Existing PMP", self._existing_pmp_edit.text(),
+            "Proteus Mod Pack (*.pmp)"
+        )
+        if f:
+            self._existing_pmp_edit.setText(f)
+            self._read_ui_settings()
+
+    def _browse_colorset_meta(self):
+        f, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self._widget, "Select Proteus metadata.json",
+            self._colorset_meta_edit.text(), "Proteus metadata (*.json)"
+        )
+        if f:
+            self._colorset_meta_edit.setText(f)
+            self._read_ui_settings()
 
     def _load_mat_preset(self):
         name = self._mat_preset_combo.currentText()
@@ -262,7 +329,7 @@ class ProteusPackagerPlugin:
 
     def _refresh_export_presets(self, select: str = ""):
         """Repopulate the export preset combo. select is a saved resource URL."""
-        presets = _list_export_presets()
+        presets = _list_export_presets(log=self._log)
         current_url = select or self._export_preset_combo.currentData() or ""
         self._export_preset_combo.blockSignals(True)
         self._export_preset_combo.clear()
@@ -281,7 +348,9 @@ class ProteusPackagerPlugin:
     def _log(self, msg: str):
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         line = f"[{ts}] {msg}"
-        # Append safely from any thread; connection type name differs between PySide versions.
+        print(f"[ProteusPackager] {msg}")  # always visible in SP Python console
+        if not hasattr(self, "_log_edit") or self._log_edit is None:
+            return
         try:
             conn = QtCore.Qt.ConnectionType.QueuedConnection  # PySide6
         except AttributeError:
@@ -292,7 +361,6 @@ class ProteusPackagerPlugin:
                 QtCore.Q_ARG(str, line),
             )
         except TypeError:
-            # PySide6 dropped Q_ARG in some builds; call directly on main thread
             self._log_edit.appendPlainText(line)
 
     # ── Events ────────────────────────────────────────────────────────────────
@@ -309,7 +377,7 @@ class ProteusPackagerPlugin:
             substance_painter.event.DISPATCHER.connect(event_type, self._on_project_opened)
 
     def _on_project_opened(self, _ev=None):
-        self._refresh_export_presets()
+        self._refresh_export_presets(select=self._export_preset)
 
     def _on_sp_export_finished(self, _res):
         self._read_ui_settings()
@@ -331,6 +399,8 @@ class ProteusPackagerPlugin:
     def _read_ui_settings(self):
         self._author = self._author_edit.text().strip()
         self._output_dir = self._output_edit.text().strip()
+        self._existing_pmp = self._existing_pmp_edit.text().strip()
+        self._colorset_meta = self._colorset_meta_edit.text().strip()
         # Prefer the stored URL (item data); fall back to typed text for manual entry
         self._export_preset = (self._export_preset_combo.currentData()
                                or self._export_preset_combo.currentText().strip())
@@ -352,6 +422,9 @@ class ProteusPackagerPlugin:
             self._log("Export Preset is required. Enter your SP export preset name in the settings.")
             return
 
+        # Resolve file:/// URIs to resource:// by importing as a session resource
+        resolved_preset = _resolve_preset_url(self._export_preset, log=self._log)
+
         mod_name = substance_painter.project.name() or "UnnamedMod"
         author = self._author or "Unknown"
         mat_paths = [p.strip() for p in self._material_paths.splitlines() if p.strip()]
@@ -371,22 +444,122 @@ class ProteusPackagerPlugin:
         ))
 
         # 2. Build temp directories
+        merge_path = self._existing_pmp
+        merge = bool(merge_path)
+        if merge and not (merge_path.lower().endswith(".pmp")
+                          and os.path.isfile(merge_path)):
+            self._log(f"Existing PMP not found or not a .pmp file: {merge_path}")
+            return
+
         tmpdir = tempfile.mkdtemp(prefix="proteus_pmp_")
         export_root = os.path.join(tmpdir, "_exports")  # intermediate SP exports
         pmp_root = os.path.join(tmpdir, "_pmp")         # final .pmp content
         proteus_dir = os.path.join(pmp_root, "Proteus")
         os.makedirs(export_root)
-        os.makedirs(proteus_dir)
+
+        if merge:
+            os.makedirs(pmp_root)
+            try:
+                shutil.unpack_archive(merge_path, pmp_root, format="zip")
+            except Exception as exc:
+                self._log(f"Failed to open existing PMP: {exc}")
+                shutil.rmtree(tmpdir, ignore_errors=True)
+                return
+            os.makedirs(proteus_dir, exist_ok=True)
+            meta_path = os.path.join(pmp_root, "meta.json")
+            if os.path.isfile(meta_path):
+                try:
+                    with open(meta_path, encoding="utf-8") as f:
+                        em = json.load(f)
+                    mod_name = em.get("Name") or mod_name
+                    author = em.get("Author") or author
+                except Exception as exc:
+                    self._log(f"Could not read existing meta.json: {exc}")
+        else:
+            os.makedirs(proteus_dir)
 
         # 3. Save current layer visibility
         saved_vis = _save_visibility(ts_node_map)
 
         try:
             groups_order = list(structure.keys())
-            option_groups_meta = []
+            option_groups_meta = []          # fresh-mode Proteus OptionGroups
+
+            colorset_map: dict = {}
+            if self._colorset_meta:
+                if os.path.isfile(self._colorset_meta):
+                    colorset_map = _load_colorset_map(self._colorset_meta, log=self._log)
+                    self._log(f"Loaded colorsets from {self._colorset_meta}")
+                else:
+                    self._log(f"Colorset metadata not found: {self._colorset_meta}")
+
+            # Merge-mode: load existing Proteus/Penumbra content to append to
+            proteus_meta = None
+            pg_by_name: dict = {}            # group name -> Proteus OptionGroup
+            grp_files: dict = {}             # group name -> [json path, data]
+            touched_group_files: dict = {}   # json path -> data to rewrite
+            max_idx = 0
+            if merge:
+                pm_path = os.path.join(proteus_dir, "metadata.json")
+                if os.path.isfile(pm_path):
+                    try:
+                        with open(pm_path, encoding="utf-8") as f:
+                            proteus_meta = json.load(f)
+                    except Exception as exc:
+                        self._log(f"Could not read existing Proteus/metadata.json: {exc}")
+                if not isinstance(proteus_meta, dict):
+                    proteus_meta = {"FormatVersion": 1, "Name": mod_name,
+                                    "Author": author, "OptionGroups": []}
+                proteus_meta.setdefault("OptionGroups", [])
+                for og in proteus_meta["OptionGroups"]:
+                    pg_by_name[og.get("PenumbraGroupName")] = og
+                for gp in sorted(Path(pmp_root).glob("group_*.json")):
+                    try:
+                        with open(gp, encoding="utf-8") as f:
+                            gdata = json.load(f)
+                    except Exception:
+                        continue
+                    m = re.match(r"group_(\d+)_", gp.name)
+                    if m:
+                        max_idx = max(max_idx, int(m.group(1)))
+                    gname = gdata.get("Name")
+                    if gname is not None:
+                        grp_files[gname] = [str(gp), gdata]
 
             for group in groups_order:
-                options_meta = []
+                if merge:
+                    og = pg_by_name.get(group)
+                    if og is None:
+                        og = {"PenumbraGroupName": group, "Options": []}
+                        proteus_meta["OptionGroups"].append(og)
+                        pg_by_name[group] = og
+                    og.setdefault("Options", [])
+
+                    if group in grp_files:
+                        gpath, gdata = grp_files[group]
+                    else:
+                        max_idx += 1
+                        safe = re.sub(r"[^\w]", "_", group).lower()
+                        gpath = os.path.join(pmp_root, f"group_{max_idx:03d}_{safe}.json")
+                        gdata = {"Version": 0, "Name": group, "Description": "",
+                                 "Image": "", "Page": 0, "Priority": 0,
+                                 "Type": group_type, "DefaultSettings": 0,
+                                 "Options": []}
+                        grp_files[group] = [gpath, gdata]
+                    gdata.setdefault("Options", [])
+                    touched_group_files[gpath] = gdata
+
+                    proteus_opts = og["Options"]
+                    penumbra_opts = gdata["Options"]
+                    taken = {o.get("Name") for o in proteus_opts}
+                    taken |= {o.get("Name") for o in penumbra_opts}
+                    if "None" not in taken:
+                        proteus_opts.append(_none_proteus_option())
+                        penumbra_opts.append(_none_penumbra_option())
+                        taken.add("None")
+                else:
+                    proteus_opts = []
+                    penumbra_opts = None
 
                 for option in structure[group]:
                     self._log(f"Exporting {group}/{option}…")
@@ -397,15 +570,21 @@ class ProteusPackagerPlugin:
                     # Ask SP to export
                     opt_export_dir = os.path.join(export_root, group, option)
                     os.makedirs(opt_export_dir, exist_ok=True)
-                    exported_files = self._do_sp_export(ts_names, opt_export_dir)
+                    exported_files = self._do_sp_export(ts_names, opt_export_dir, resolved_preset)
 
                     if not exported_files:
                         self._log(f"  No files produced — skipping {group}/{option}")
                         continue
 
-                    # Copy recognised files into the Proteus sidecar tree
-                    rel_subdir = f"{group}/{option}"
-                    abs_subdir = os.path.join(proteus_dir, group, option)
+                    final_name = option
+
+                    # Copy recognised files into the Proteus sidecar tree.
+                    # On merge, wipe any existing folder for this option so a
+                    # replace can't leave stale textures behind.
+                    rel_subdir = f"{group}/{final_name}"
+                    abs_subdir = os.path.join(proteus_dir, group, final_name)
+                    if merge and os.path.isdir(abs_subdir):
+                        shutil.rmtree(abs_subdir, ignore_errors=True)
                     os.makedirs(abs_subdir, exist_ok=True)
 
                     overlay: dict = {}
@@ -421,56 +600,100 @@ class ProteusPackagerPlugin:
                         overlay[tex_type] = f"{rel_subdir}/{fname}"
                         self._log(f"  {tex_type}: {rel_subdir}/{fname}")
 
-                    options_meta.append({
-                        "Name": option,
+                    color_rows = (colorset_map.get((group, option))
+                                  or colorset_map.get((None, option)))
+                    if color_rows is None:
+                        color_rows = [{"Row": 16, "SubRowA": {"Diffuse": "#FFFFFF"}}]
+                    elif self._colorset_meta:
+                        self._log(f"  Colorset reused for '{option}'")
+
+                    pro_entry = {
+                        "Name": final_name,
                         "Overlays": [overlay],
-                        "ColorTableRows": [{"Row": 16, "SubRowA": {"Diffuse": "#FFFFFF"}}],
+                        "ColorTableRows": color_rows,
+                    }
+                    if merge:
+                        replaced = _upsert_option(proteus_opts, pro_entry)
+                        _upsert_option(penumbra_opts, {
+                            "Name": final_name, "Description": "", "Files": {},
+                            "FileSwaps": {}, "Manipulations": []})
+                        if replaced:
+                            self._log(f"  Replaced existing option '{final_name}'")
+                    else:
+                        proteus_opts.append(pro_entry)
+
+                if not merge:
+                    option_groups_meta.append({
+                        "PenumbraGroupName": group,
+                        "Options": [_none_proteus_option()] + proteus_opts,
                     })
 
-                option_groups_meta.append({
-                    "PenumbraGroupName": group,
-                    "Options": options_meta,
+            if merge:
+                # Update the Proteus sidecar + only the touched group files;
+                # preserve the pack's existing meta.json / default_mod.json.
+                _write_json(os.path.join(proteus_dir, "metadata.json"), proteus_meta)
+                for gpath, gdata in touched_group_files.items():
+                    _write_json(gpath, gdata)
+                if not os.path.isfile(os.path.join(pmp_root, "meta.json")):
+                    _write_json(os.path.join(pmp_root, "meta.json"), {
+                        "FileVersion": 3, "Name": mod_name, "Author": author,
+                        "Description": "", "Version": "1.0", "Website": "",
+                        "ModTags": [],
+                    })
+                if not os.path.isfile(os.path.join(pmp_root, "default_mod.json")):
+                    _write_json(os.path.join(pmp_root, "default_mod.json"),
+                                {"Files": {}, "Swaps": {}, "Manipulations": []})
+
+                # Zip and atomically overwrite the source .pmp in place
+                archive = shutil.make_archive(
+                    os.path.join(tmpdir, "_merged"), "zip", pmp_root)
+                tmp_dest = merge_path + ".tmp"
+                if os.path.exists(tmp_dest):
+                    os.remove(tmp_dest)
+                shutil.move(archive, tmp_dest)
+                os.replace(tmp_dest, merge_path)
+                self._log(f"Done (merged in place): {merge_path}")
+            else:
+                # Proteus/metadata.json
+                _write_json(os.path.join(proteus_dir, "metadata.json"), {
+                    "FormatVersion": 1,
+                    "Name": mod_name,
+                    "Author": author,
+                    "OptionGroups": option_groups_meta,
                 })
 
-            # Proteus/metadata.json
-            _write_json(os.path.join(proteus_dir, "metadata.json"), {
-                "FormatVersion": 1,
-                "Name": mod_name,
-                "Author": author,
-                "OptionGroups": option_groups_meta,
-            })
+                # meta.json
+                _write_json(os.path.join(pmp_root, "meta.json"), {
+                    "FileVersion": 3, "Name": mod_name, "Author": author,
+                    "Description": "", "Version": "1.0", "Website": "", "ModTags": [],
+                })
 
-            # meta.json
-            _write_json(os.path.join(pmp_root, "meta.json"), {
-                "FileVersion": 3, "Name": mod_name, "Author": author,
-                "Description": "", "Version": "1.0", "Website": "", "ModTags": [],
-            })
+                # default_mod.json
+                _write_json(os.path.join(pmp_root, "default_mod.json"),
+                            {"Files": {}, "Swaps": {}, "Manipulations": []})
 
-            # default_mod.json
-            _write_json(os.path.join(pmp_root, "default_mod.json"),
-                        {"Files": {}, "Swaps": {}, "Manipulations": []})
-
-            # group_NNN_{name}.json
-            for idx, group in enumerate(groups_order, start=1):
-                opts = [{"Name": o, "Description": "", "Files": {}, "FileSwaps": {}, "Manipulations": []}
+                # group_NNN_{name}.json
+                for idx, group in enumerate(groups_order, start=1):
+                    opts = [_none_penumbra_option()] + [
+                        {"Name": o, "Description": "", "Files": {}, "FileSwaps": {}, "Manipulations": []}
                         for o in structure[group]]
-                safe = re.sub(r"[^\w]", "_", group).lower()
-                _write_json(os.path.join(pmp_root, f"group_{idx:03d}_{safe}.json"), {
-                    "Version": 0, "Name": group, "Description": "", "Image": "",
-                    "Page": 0, "Priority": 0, "Type": group_type,
-                    "DefaultSettings": 0, "Options": opts,
-                })
+                    safe = re.sub(r"[^\w]", "_", group).lower()
+                    _write_json(os.path.join(pmp_root, f"group_{idx:03d}_{safe}.json"), {
+                        "Version": 0, "Name": group, "Description": "", "Image": "",
+                        "Page": 0, "Priority": 0, "Type": group_type,
+                        "DefaultSettings": 0, "Options": opts,
+                    })
 
-            # ZIP pmp_root → .pmp
-            out_dir = self._resolve_output_dir()
-            os.makedirs(out_dir, exist_ok=True)
-            zip_base = os.path.join(out_dir, mod_name)
-            archive = shutil.make_archive(zip_base, "zip", pmp_root)
-            pmp_path = zip_base + ".pmp"
-            if os.path.exists(pmp_path):
-                os.remove(pmp_path)
-            os.rename(archive, pmp_path)
-            self._log(f"Done: {pmp_path}")
+                # ZIP pmp_root → .pmp
+                out_dir = self._resolve_output_dir()
+                os.makedirs(out_dir, exist_ok=True)
+                zip_base = os.path.join(out_dir, mod_name)
+                archive = shutil.make_archive(zip_base, "zip", pmp_root)
+                pmp_path = zip_base + ".pmp"
+                if os.path.exists(pmp_path):
+                    os.remove(pmp_path)
+                os.rename(archive, pmp_path)
+                self._log(f"Done: {pmp_path}")
 
         except Exception as exc:
             self._log(f"Error: {exc}")
@@ -478,17 +701,18 @@ class ProteusPackagerPlugin:
             _restore_visibility(ts_node_map, saved_vis)
             shutil.rmtree(tmpdir, ignore_errors=True)
 
-    def _do_sp_export(self, ts_names: list[str], output_dir: str) -> list[str]:
+    def _do_sp_export(self, ts_names: list[str], output_dir: str,
+                      preset_url: str = "") -> list[str]:
         config = {
             "exportShaderParams": False,
             "exportPath": output_dir,
             "exportList": [{"rootPath": ts} for ts in ts_names],
-            "defaultExportPreset": self._export_preset,  # must be a resource:// URL
+            "defaultExportPreset": preset_url or self._export_preset,
+            "exportParameters": [{"parameters": {"paddingAlgorithm": "infinite"}}],
         }
         try:
             result = substance_painter.export.export_project_textures(config)
             files: list[str] = []
-            # textures is Dict[Tuple[ts_name, stack_name], List[str]]
             for file_list in result.textures.values():
                 files.extend(file_list)
             return files
@@ -498,11 +722,20 @@ class ProteusPackagerPlugin:
 
     def _detect_type(self, fpath: str):
         stem = Path(fpath).stem
+        # Configured suffix match (longest suffix wins)
         for key in ("Diffuse", "Normal", "Index", "Mask"):
             for sfx in sorted(self._suffixes[key], key=len, reverse=True):
                 if stem.endswith(sfx):
                     return key
-        return None
+        # Fallback: bare channel name (presets that output "diffuse.png" etc.)
+        _BARE = {
+            "diffuse": "Diffuse", "color": "Diffuse", "colour": "Diffuse",
+            "basecolor": "Diffuse", "albedo": "Diffuse",
+            "normal": "Normal", "normalgl": "Normal", "normal_opengl": "Normal",
+            "index": "Index", "indexcolor": "Index", "id": "Index",
+            "mask": "Mask",
+        }
+        return _BARE.get(stem.lower())
 
     def _resolve_output_dir(self) -> str:
         if self._output_dir:
@@ -546,7 +779,7 @@ def _discover_structure(all_ts: list):
 
     for ts in all_ts:
         ts_name = ts.name()
-        top_nodes = _ls.get_nodes(ts.get_stack())
+        top_nodes = list(_ls.get_root_layer_nodes(ts.get_stack()))
         ts_data: dict = {"_top": top_nodes}
         ts_node_map[ts_name] = ts_data
 
@@ -624,70 +857,201 @@ def _restore_recursive(node, key: str, saved: dict):
 # ── SP API compatibility shims ────────────────────────────────────────────────
 
 def _is_group(node) -> bool:
-    try:
-        return node.node_type == _ls.NodeType.GroupLayer
-    except AttributeError:
-        pass
-    try:
-        return isinstance(node, _ls.GroupLayer)
-    except Exception:
-        return False
+    # Try NodeType enum — value name changed across SP versions
+    for attr in ("GroupLayer", "GroupLayerNode", "GROUP_LAYER", "GROUP"):
+        try:
+            return node.node_type == getattr(_ls.NodeType, attr)
+        except AttributeError:
+            continue
+    # Fall back to isinstance check — class also renamed across versions
+    for cls_name in ("GroupLayerNode", "GroupLayer"):
+        try:
+            return isinstance(node, getattr(_ls, cls_name))
+        except Exception:
+            continue
+    return False
 
 
 def _node_name(node) -> str:
-    try:
-        return node.name or ""
-    except AttributeError:
+    for getter in ("get_name", "name"):
         try:
-            return node.get_name() or ""
+            val = getattr(node, getter)
+            return (val() if callable(val) else val) or ""
         except Exception:
-            return ""
+            continue
+    return ""
 
 
 def _node_visible(node) -> bool:
-    try:
-        return bool(node.visible)
-    except AttributeError:
+    for getter in ("is_visible", "get_visible", "visible"):
         try:
-            return bool(node.get_visible())
+            val = getattr(node, getter)
+            return bool(val() if callable(val) else val)
         except Exception:
-            return True
+            continue
+    return True
 
 
 def _node_children(node) -> list:
-    try:
-        return list(node.children())
-    except Exception:
-        return []
+    for getter in ("sub_layers", "nodes", "children", "get_children", "layers"):
+        try:
+            return list(getattr(node, getter)())
+        except Exception:
+            continue
+    return []
 
 
 # ── Misc helpers ──────────────────────────────────────────────────────────────
 
-def _list_export_presets() -> list[tuple[str, str]]:
+def _resolve_preset_url(preset_url: str, log=None) -> str:
     """
-    Return sorted list of (display_name, resource_url) for all SP export presets.
-    Uses resource.search() + Type.EXPORT filter — the actual SP Python API.
+    If preset_url is a file:/// URI pointing to a .spexp file, import it as a
+    session resource so SP's export API can resolve it, and return the resulting
+    resource:// URL.  All other URL schemes are returned unchanged.
     """
+    if not preset_url.startswith("file:///"):
+        return preset_url
+
+    import urllib.parse
     import substance_painter.resource as spres
+
+    # file:///C:/path/Proteus.spexp  ->  C:/path/Proteus.spexp
+    file_path = urllib.parse.unquote(preset_url[len("file:///"):])
+
     try:
-        all_res = spres.search(spres.StandardQuery.ALL_RESOURCES)
-        presets = []
-        for r in all_res:
-            try:
-                if r.type() != spres.Type.EXPORT:
-                    continue
-                name = r.gui_name() or r.identifier().name
-                url = r.identifier().url()
-                presets.append((name, url))
-            except Exception:
+        resource = spres.import_session_resource(file_path, spres.Usage.EXPORT)
+        url = resource.identifier().url()
+        if log:
+            log(f"[preset] Registered '{Path(file_path).stem}' as session resource: {url}")
+        return url
+    except Exception as e:
+        if log:
+            log(f"[preset] Session import failed: {e}. Using URL as-is.")
+        return preset_url
+
+
+def _list_export_presets(log=None) -> list[tuple[str, str]]:
+    """
+    Return sorted list of (display_name, resource_url) for all SP output templates.
+
+    Sources (in priority order):
+      1. Predefined presets via SP export API  — correct working URLs guaranteed.
+      2. Resource (shelf) presets via SP export API — 0 currently but future-proof.
+      3. Filesystem scan of starter_assets .spexp files.
+      4. Filesystem scan of user assets .spexp files (URL may not resolve).
+    """
+    import substance_painter
+    import substance_painter.export as spexp
+
+    def _dbg(msg):
+        if log:
+            log(f"[preset-scan] {msg}")
+
+    seen: set[str] = set()
+    presets: list[tuple[str, str]] = []
+
+    # 1. Predefined presets (embedded in application, guaranteed resolvable)
+    try:
+        for pp in spexp.list_predefined_export_presets():
+            if pp.url not in seen:
+                seen.add(pp.url)
+                presets.append((pp.name, pp.url))
+                _dbg(f"predefined: {pp.name!r} -> {pp.url}")
+    except Exception as e:
+        _dbg(f"list_predefined_export_presets error: {e}")
+
+    # 2. Resource (shelf) presets — includes user-imported ones when registered
+    try:
+        before = len(presets)
+        for rp in spexp.list_resource_export_presets():
+            url = rp.resource_id.url()
+            if url not in seen:
+                seen.add(url)
+                presets.append((rp.resource_id.name, url))
+        added = len(presets) - before
+        if added:
+            _dbg(f"resource presets: {added}")
+    except Exception as e:
+        _dbg(f"list_resource_export_presets error: {e}")
+
+    # 3. Filesystem: built-in .spexp files
+    try:
+        sp_pkg = Path(substance_painter.__file__).parent
+        resources_dir = sp_pkg.parent.parent.parent / "starter_assets" / "export-presets"
+        for f in sorted(resources_dir.glob("*.spexp")):
+            if f.stem.startswith("."):
                 continue
-        return sorted(presets, key=lambda t: t[0].lower())
-    except Exception:
-        return []
+            url = f"resource://starter_assets/{f.stem}"
+            if url not in seen:
+                seen.add(url)
+                presets.append((f.stem, url))
+    except Exception as e:
+        _dbg(f"built-in scan error: {e}")
+
+    # 4. Filesystem: user .spexp files — try file:// URI (absolute path)
+    try:
+        user_dir = Path(__file__).parent.parent.parent / "assets" / "export-presets"
+        for f in sorted(user_dir.glob("*.spexp")):
+            if f.stem.startswith("."):
+                continue
+            url = f.as_uri()  # file:///C:/Users/.../Proteus.spexp
+            if url not in seen:
+                seen.add(url)
+                presets.append((f"[User] {f.stem}", url))
+                _dbg(f"user: {f.stem!r} -> {url}")
+    except Exception as e:
+        _dbg(f"user scan error: {e}")
+
+    _dbg(f"total presets found: {len(presets)}")
+    return sorted(presets, key=lambda t: t[0].lower())
 
 
 def _split_csv(text: str) -> list[str]:
     return [x.strip() for x in text.split(",") if x.strip()]
+
+
+def _upsert_option(options: list, entry: dict) -> bool:
+    """Insert entry into options, or replace an existing entry with the same
+    Name. Returns True if an existing option was replaced."""
+    for i, o in enumerate(options):
+        if o.get("Name") == entry["Name"]:
+            options[i] = entry
+            return True
+    options.append(entry)
+    return False
+
+
+def _none_penumbra_option() -> dict:
+    return {"Name": "None", "Description": "", "Files": {},
+            "FileSwaps": {}, "Manipulations": []}
+
+
+def _none_proteus_option() -> dict:
+    return {"Name": "None", "Overlays": [], "ColorTableRows": []}
+
+
+def _load_colorset_map(path: str, log=None) -> dict:
+    """Read an existing Proteus metadata.json and map its options'
+    ColorTableRows. Keyed by (group, name) and (None, name) so a lookup can
+    fall back to matching on option name alone."""
+    cmap: dict = {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as exc:
+        if log:
+            log(f"[colorset] Could not read {path}: {exc}")
+        return cmap
+    for og in data.get("OptionGroups", []):
+        g = og.get("PenumbraGroupName")
+        for o in og.get("Options", []):
+            rows = o.get("ColorTableRows")
+            name = o.get("Name")
+            if rows is None or name is None:
+                continue
+            cmap[(g, name)] = rows
+            cmap.setdefault((None, name), rows)
+    return cmap
 
 
 def _write_json(path: str, data):
