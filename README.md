@@ -78,6 +78,7 @@ Multiple texture sets work fine — the plugin walks all texture sets and builds
 | **Preset / Load** | Quick-load a saved set of material paths. Ships with a **Bibo+** preset. |
 | **Suffix mappings** | How exported filenames map to overlay types. Comma-separated, longest match wins. |
 | **Mutually exclusive options** | Checked → Penumbra group type `Single`; unchecked → `Multi`. |
+| **Generate previews** | Manual button. Iterates every option, force-shows its Colorset sub-folder layers, switches SP to 3D-only view, screenshots the viewport, and saves into `<OutputDir>/<ModName>/<group>/<option>.png` plus a near-square `<ModName>_preview.png` index grid. The next **Export PMP** picks these up automatically — see [Preview images in the pack](#preview-images-in-the-pack). Layer visibility (and the colorset-layer hide rule used by **Export PMP**) are restored when done. |
 | **Export PMP** | Manual trigger. |
 
 ### Suffix mappings
@@ -160,6 +161,24 @@ MyMod.pmp  (renamed .zip)
 ```
 
 Every exported PNG receives a small `tEXt` chunk stamped with its option's path (e.g. `Style/Roses`). Penumbra auto-deduplicates identical files, which would otherwise collapse pixel-identical index/mask textures across options into a single file and break per-option overlays. The stamp keeps the pixel data identical but the file bytes distinct, so Penumbra leaves each option's textures alone.
+
+---
+
+## Preview images in the pack
+
+If you've clicked **Generate previews** at any point, the next **Export PMP** automatically bundles those screenshots into the pack:
+
+```
+MyMod.pmp
+└── images/
+    ├── Style/
+    │   ├── Roses.png
+    │   └── Stripes.png
+    └── Pattern/
+        └── Dots.png
+```
+
+Each Penumbra option's `Image` field in `group_NNN_*.json` is filled in with the matching `images/<Group>/<Option>.png` relative path, so Penumbra's option list shows the screenshot next to each name. Options without a preview on disk get an empty `Image` (Penumbra falls back to a generic icon). Re-run **Generate previews** after renaming or adding options so the bundled images stay in sync.
 
 ---
 

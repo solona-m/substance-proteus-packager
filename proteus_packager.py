@@ -295,6 +295,15 @@ class ProteusPackagerPlugin:
         export_btn.clicked.connect(self._on_export_pmp_clicked)
         root.addWidget(export_btn)
 
+        preview_btn = QtWidgets.QPushButton("Generate previews")
+        preview_btn.setToolTip(
+            "For each option in the layer stack, switch to 3D-only view, "
+            "show its Colorset layers, screenshot the viewport, then save "
+            "individual PNGs to <OutputDir>/<ModName>/ plus a combined grid."
+        )
+        preview_btn.clicked.connect(self._on_generate_previews_clicked)
+        root.addWidget(preview_btn)
+
         substance_painter.ui.add_dock_widget(self._widget)
         self._connect_ui_autosave()
 
@@ -419,6 +428,69 @@ class ProteusPackagerPlugin:
             return
         self._build_pmp()
 
+    def _on_generate_previews_clicked(self):
+        self._read_ui_settings()
+        if not substance_painter.project.is_open():
+            self._log("No project open.")
+            return
+        self._generate_previews()
+
+    def _generate_previews(self):
+        if not _HAS_LAYERSTACK:
+            self._log("Layerstack API not available — cannot generate previews.")
+            return
+        all_ts = list(substance_painter.textureset.all_texture_sets())
+        structure, ts_node_map, _colorset_layers = _discover_structure(all_ts)
+        if not structure:
+            self._log("No group/option folder hierarchy found in the layer stack.")
+            return
+
+        mod_name = substance_painter.project.name() or "UnnamedMod"
+        out_dir = self._resolve_output_dir()
+        os.makedirs(out_dir, exist_ok=True)
+
+        # Wipe + recreate the per-option folder so stale files / cached
+        # thumbnails can't shadow the fresh run.
+        per_opt_dir = os.path.join(out_dir, mod_name)
+        if os.path.isdir(per_opt_dir):
+            shutil.rmtree(per_opt_dir, ignore_errors=True)
+        os.makedirs(per_opt_dir, exist_ok=True)
+
+        _set_viewport_3d_only(self._log)
+
+        saved_vis = _save_visibility(ts_node_map)
+        tiles: list = []
+        try:
+            for group in structure.keys():
+                for option in structure[group]:
+                    _set_visibility_for_option(ts_node_map, group, option)
+                    _show_colorset_layers_for_option(ts_node_map, group, option)
+                    pm = _grab_viewport_pixmap(self._log)
+                    if pm is None:
+                        self._log(f"  [preview] Skipped {group}/{option} — no pixmap.")
+                        continue
+                    sg = _safe_path_component(group)
+                    so = _safe_path_component(option)
+                    group_dir = os.path.join(per_opt_dir, sg)
+                    os.makedirs(group_dir, exist_ok=True)
+                    out = os.path.join(group_dir, so + ".png")
+                    if pm.save(out, "PNG"):
+                        tiles.append((f"{group} / {option}", pm))
+                    else:
+                        self._log(f"  [preview] Could not save {out}")
+        finally:
+            _restore_visibility(ts_node_map, saved_vis)
+
+        self._log(f"Saved {len(tiles)} per-option preview(s) to {per_opt_dir}")
+        if tiles:
+            grid_path = os.path.join(per_opt_dir, f"{mod_name}_preview.png")
+            if os.path.isfile(grid_path):
+                try:
+                    os.remove(grid_path)
+                except Exception:
+                    pass
+            _composite_preview_grid(tiles, grid_path, log=self._log)
+
     def _read_ui_settings(self):
         self._author = self._author_edit.text().strip()
         self._output_dir = self._output_edit.text().strip()
@@ -510,6 +582,7 @@ class ProteusPackagerPlugin:
         try:
             groups_order = list(structure.keys())
             option_groups_meta = []          # fresh-mode Proteus OptionGroups
+            option_images: dict = {}         # (group, option) -> rel image path
 
             colorset_map: dict = {}
             if self._colorset_meta:
@@ -646,11 +719,17 @@ class ProteusPackagerPlugin:
                         "Overlays": [overlay],
                         "ColorTableRows": color_rows,
                     }
+                    image_rel = _maybe_copy_preview_into_pack(
+                        self._resolve_output_dir(), mod_name,
+                        group, final_name, pmp_root)
+                    if image_rel:
+                        option_images[(group, final_name)] = image_rel
                     if merge:
                         replaced = _upsert_option(proteus_opts, pro_entry)
                         _upsert_option(penumbra_opts, {
-                            "Name": final_name, "Description": "", "Files": {},
-                            "FileSwaps": {}, "Manipulations": []})
+                            "Name": final_name, "Description": "",
+                            "Image": image_rel,
+                            "Files": {}, "FileSwaps": {}, "Manipulations": []})
                         if replaced:
                             self._log(f"  Replaced existing option '{final_name}'")
                     else:
@@ -709,7 +788,9 @@ class ProteusPackagerPlugin:
                 # group_NNN_{name}.json
                 for idx, group in enumerate(groups_order, start=1):
                     opts = [_none_penumbra_option()] + [
-                        {"Name": o, "Description": "", "Files": {}, "FileSwaps": {}, "Manipulations": []}
+                        {"Name": o, "Description": "",
+                         "Image": option_images.get((group, o), ""),
+                         "Files": {}, "FileSwaps": {}, "Manipulations": []}
                         for o in structure[group]]
                     safe = re.sub(r"[^\w]", "_", group).lower()
                     _write_json(os.path.join(pmp_root, f"group_{idx:03d}_{safe}.json"), {
@@ -811,6 +892,129 @@ class ProteusPackagerPlugin:
             self._widget = None
 
 
+# ── Viewport screenshot + grid composite ──────────────────────────────────────
+
+_VIEWPORT_RENDER_WAIT_MS = 600
+
+
+def _wait_for_viewport(ms: int = _VIEWPORT_RENDER_WAIT_MS):
+    """Block for `ms` milliseconds while the Qt event loop keeps running.
+    Lets SP finish baking textures and repainting the viewport after a layer
+    visibility change. Cheap processEvents() loops aren't enough — they return
+    immediately when the queue is empty even if the GL render is still
+    in-flight."""
+    app = QtWidgets.QApplication.instance()
+    if app is None:
+        return
+    loop = QtCore.QEventLoop()
+    QtCore.QTimer.singleShot(ms, loop.quit)
+    loop.exec()
+
+
+def _grab_viewport_pixmap(log=None):
+    """Return a QPixmap of just SP's 3D viewport region, or None on failure.
+
+    Strategy: find the viewport widget (SP exposes it as a plain QWidget) to
+    determine its on-screen rect, but capture pixels via QScreen.grabWindow()
+    against the desktop. That avoids two problems with widget.grab(): it can't
+    capture OpenGL surfaces, and SP recreates the viewport widget during the
+    render loop ('Internal C++ object already deleted'). We read the widget's
+    geometry into plain ints and drop the ref before calling grabWindow."""
+    _wait_for_viewport()
+    try:
+        mw = substance_painter.ui.get_main_window()
+    except Exception as exc:
+        if log:
+            log(f"  [preview] get_main_window failed: {exc}")
+        return None
+    if mw is None:
+        return None
+    screen = mw.screen() if hasattr(mw, "screen") else None
+    if screen is None:
+        screen = QtGui.QGuiApplication.primaryScreen()
+    if screen is None:
+        return None
+
+    try:
+        # Pick the largest visible plain QWidget — that's the 3D viewport
+        # container in SP. We only read geometry, never call grab() on it.
+        candidates = []
+        for w in mw.findChildren(QtWidgets.QWidget):
+            if type(w) is not QtWidgets.QWidget:
+                continue
+            if not w.isVisible():
+                continue
+            sz = w.size()
+            if sz.width() < 200 or sz.height() < 200:
+                continue
+            origin = w.mapToGlobal(QtCore.QPoint(0, 0))
+            candidates.append((sz.width() * sz.height(),
+                               origin.x(), origin.y(),
+                               sz.width(), sz.height()))
+        if candidates:
+            candidates.sort(reverse=True)
+            _, x, y, gw, gh = candidates[0]
+        else:
+            if log:
+                log("  [preview] No viewport candidate found; grabbing whole window.")
+            origin = mw.mapToGlobal(QtCore.QPoint(0, 0))
+            x, y, gw, gh = origin.x(), origin.y(), mw.width(), mw.height()
+
+        pm = screen.grabWindow(0, x, y, gw, gh)
+        if pm.isNull():
+            return None
+        # Crop the viewport's own chrome:
+        #   top ~6%   — brush toolbar + Material dropdown (top-right)
+        #   bottom ~5% — MASK indicator (bottom-left) + nav compass (bottom-right)
+        # Percentages, so this scales with widget size / DPI / SP version.
+        W, H = pm.width(), pm.height()
+        top_crop = int(H * 0.06)
+        bot_crop = int(H * 0.05)
+        if H - top_crop - bot_crop > 100:
+            pm = pm.copy(0, top_crop, W, H - top_crop - bot_crop)
+        return pm
+    except RuntimeError as exc:
+        if log:
+            log(f"  [preview] Viewport grab failed: {exc}")
+        return None
+
+
+def _composite_preview_grid(tiles, out_path, tile_w=256, label_h=24, log=None):
+    """tiles: list of (label:str, QPixmap). Save a near-square grid PNG to
+    out_path. Returns True on success."""
+    if not tiles:
+        return False
+    import math
+    cols = max(1, math.ceil(math.sqrt(len(tiles))))
+    rows = math.ceil(len(tiles) / cols)
+    cell_h = tile_w + label_h
+    canvas = QtGui.QPixmap(cols * tile_w, rows * cell_h)
+    canvas.fill(QtGui.QColor(32, 32, 32))
+    painter = QtGui.QPainter(canvas)
+    try:
+        font = painter.font()
+        font.setPointSize(9)
+        painter.setFont(font)
+        painter.setPen(QtGui.QColor(220, 220, 220))
+        for i, (label, pm) in enumerate(tiles):
+            col, row = i % cols, i // cols
+            x, y = col * tile_w, row * cell_h
+            scaled = pm.scaled(tile_w, tile_w,
+                               QtCore.Qt.KeepAspectRatio,
+                               QtCore.Qt.SmoothTransformation)
+            ox = x + (tile_w - scaled.width()) // 2
+            oy = y + (tile_w - scaled.height()) // 2
+            painter.drawPixmap(ox, oy, scaled)
+            painter.drawText(QtCore.QRect(x, y + tile_w, tile_w, label_h),
+                             QtCore.Qt.AlignCenter, label)
+    finally:
+        painter.end()
+    ok = canvas.save(out_path, "PNG")
+    if log:
+        log(f"Preview saved: {out_path}" if ok else f"Preview save failed: {out_path}")
+    return ok
+
+
 # ── Layer stack helpers ───────────────────────────────────────────────────────
 
 def _discover_structure(all_ts: list):
@@ -897,6 +1101,51 @@ def _set_visibility_for_option(ts_node_map: dict, group: str, option: str):
                             if _is_group(sub) and _COLORSET_FOLDER_RE.match(_node_name(sub) or ""):
                                 for layer in _node_children(sub):
                                     layer.set_visible(False)
+
+
+def _show_colorset_layers_for_option(ts_node_map: dict, group: str, option: str):
+    """Inverse of the 'hide colorset layers' step inside _set_visibility_for_option:
+    force-show every layer inside the Colorset sub-folder of the target option.
+    Used by the previews flow so each tile renders with its dye colors applied."""
+    for ts_data in ts_node_map.values():
+        opt_node = ts_data.get(group, {}).get(option)
+        if opt_node is None:
+            continue
+        for sub in _node_children(opt_node):
+            if _is_group(sub) and _COLORSET_FOLDER_RE.match(_node_name(sub) or ""):
+                sub.set_visible(True)
+                for layer in _node_children(sub):
+                    layer.set_visible(True)
+
+
+def _set_viewport_3d_only(log=None):
+    """Best-effort: trigger SP's '3D View only' menu action so the 2D pane
+    isn't part of the screenshot. Silent no-op if the action can't be found —
+    the user can switch to 3D-only manually beforehand."""
+    try:
+        mw = substance_painter.ui.get_main_window()
+    except Exception:
+        return
+    if mw is None:
+        return
+    targets = ("3d view only", "3d viewport only", "show 3d view only",
+               "3d view", "view 3d only")
+    for act in mw.findChildren(QtGui.QAction):
+        try:
+            text = (act.text() or "").lower().replace("&", "").strip()
+        except Exception:
+            continue
+        if text in targets:
+            try:
+                act.trigger()
+                if log:
+                    log(f"  [preview] Switched layout via menu action: {act.text()!r}")
+            except Exception as exc:
+                if log:
+                    log(f"  [preview] Could not trigger '{act.text()}': {exc}")
+            return
+    if log:
+        log("  [preview] No 3D-only layout action found — switch manually if 2D is visible.")
 
 
 def _save_visibility(ts_node_map: dict) -> dict:
@@ -1561,8 +1810,42 @@ def _upsert_option(options: list, entry: dict) -> bool:
 
 
 def _none_penumbra_option() -> dict:
-    return {"Name": "None", "Description": "", "Files": {},
+    return {"Name": "None", "Description": "", "Image": "", "Files": {},
             "FileSwaps": {}, "Manipulations": []}
+
+
+_FS_UNSAFE = re.compile(r'[<>:"/\\|?*]+')
+
+
+def _safe_path_component(name: str) -> str:
+    """Strip filesystem-illegal chars (Windows superset) and collapse runs."""
+    return _FS_UNSAFE.sub("_", name).strip(" .") or "_"
+
+
+def _option_preview_src(out_dir: str, mod_name: str, group: str, option: str) -> str:
+    """Where Generate Previews wrote the per-option preview PNG (may not exist)."""
+    return os.path.join(out_dir, mod_name,
+                        _safe_path_component(group),
+                        _safe_path_component(option) + ".png")
+
+
+def _maybe_copy_preview_into_pack(out_dir: str, mod_name: str,
+                                  group: str, option: str,
+                                  pmp_root: str) -> str:
+    """If a preview PNG exists for (group, option), copy it into the pack at
+    images/<group>/<option>.png and return the forward-slash relative path
+    that goes into the Penumbra option's "Image" field. If no preview exists,
+    return ''."""
+    src = _option_preview_src(out_dir, mod_name, group, option)
+    if not os.path.isfile(src):
+        return ""
+    sg = _safe_path_component(group)
+    so = _safe_path_component(option)
+    rel = f"images/{sg}/{so}.png"
+    dst = os.path.join(pmp_root, "images", sg, so + ".png")
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    shutil.copy2(src, dst)
+    return rel
 
 
 def _none_proteus_option() -> dict:
