@@ -70,8 +70,7 @@ Multiple texture sets work fine — the plugin walks all texture sets and builds
 |---|---|
 | **Author** | Written into `meta.json` and `Proteus/metadata.json`. |
 | **Output Dir** | Where the `.pmp` is saved. Defaults to the SP project's directory. Ignored in merge mode and when **Install to Penumbra** is checked. |
-| **Install to Penumbra** | When checked, copy the mod folder directly into your Penumbra mod root (loose, not zipped) instead of producing a `.pmp`. Penumbra picks it up when you refresh the mod (under edit mod). |
-| **Penumbra Root** | The Penumbra mod root directory (the folder containing one sub-folder per installed mod). Used only when **Install to Penumbra** is checked. |
+| **Install to Penumbra** | When checked, copy the mod folder directly into your Penumbra mod root (loose, not zipped) instead of producing a `.pmp`. Penumbra picks it up when you refresh the mod (under edit mod). The mod root is auto-detected from XIVLauncher's `Penumbra.json` config — no manual path required. |
 | **Existing PMP** | Optional. Leave blank to build a fresh pack. If set to an existing `.pmp`, the newly exported groups/options are merged into that pack (see [Merging](#merging-into-an-existing-pmp)). |
 | **Colorset metadata** | Optional. Select an existing Proteus `metadata.json`; exported options reuse its `ColorTableRows` (matched by option name) instead of the default white colorset. Takes precedence over any in-project [Colorset sub-folder](#colorset-sub-folder). |
 | **Export Preset** | Dropdown listing all available SP output templates. Select **[User] Proteus** when using the included template. Use **↻** to refresh after installing new templates. |
