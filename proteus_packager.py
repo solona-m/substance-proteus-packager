@@ -86,6 +86,8 @@ class ProteusPackagerPlugin:
         self._export_preset = ""
         self._mutually_exclusive = True
         self._auto_export = False
+        self._install_to_penumbra = False
+        self._penumbra_root = ""
         self._material_paths = _BIBO_PLUS_PATHS
         self._suffixes = {
             "Diffuse": ["_d"],
@@ -113,6 +115,8 @@ class ProteusPackagerPlugin:
         self._export_preset = g.get("ExportPreset", "")
         self._mutually_exclusive = cfg.getboolean("General", "MutuallyExclusive", fallback=True)
         self._auto_export = cfg.getboolean("General", "AutoExport", fallback=False)
+        self._install_to_penumbra = cfg.getboolean("General", "InstallToPenumbra", fallback=False)
+        self._penumbra_root = g.get("PenumbraRoot", "")
 
         s = cfg["Suffixes"] if "Suffixes" in cfg else {}
         self._suffixes = {
@@ -141,6 +145,8 @@ class ProteusPackagerPlugin:
             "ExportPreset": self._export_preset,
             "MutuallyExclusive": str(self._mutually_exclusive),
             "AutoExport": str(self._auto_export),
+            "InstallToPenumbra": str(self._install_to_penumbra),
+            "PenumbraRoot": self._penumbra_root,
         }
         cfg["Suffixes"] = {k: ",".join(v) for k, v in self._suffixes.items()}
         cfg["MaterialPaths"] = {"Default": self._material_paths.replace("\n", "\\n")}
@@ -177,6 +183,24 @@ class ProteusPackagerPlugin:
         browse_btn.clicked.connect(self._browse_output)
         out_row.addWidget(browse_btn)
         root.addLayout(out_row)
+
+        # Install to Penumbra (copy mod folder into Penumbra root instead of zipping)
+        pen_row = QtWidgets.QHBoxLayout()
+        self._install_penumbra_check = QtWidgets.QCheckBox("Install to Penumbra")
+        self._install_penumbra_check.setChecked(self._install_to_penumbra)
+        self._install_penumbra_check.setToolTip(
+            "When checked, copy the mod folder into the Penumbra root "
+            "directory at the end of export instead of producing a .pmp."
+        )
+        pen_row.addWidget(self._install_penumbra_check)
+        self._penumbra_root_edit = QtWidgets.QLineEdit(self._penumbra_root)
+        self._penumbra_root_edit.setPlaceholderText("Penumbra mod root directory")
+        pen_row.addWidget(self._penumbra_root_edit)
+        pen_browse_btn = QtWidgets.QPushButton("...")
+        pen_browse_btn.setFixedWidth(30)
+        pen_browse_btn.clicked.connect(self._browse_penumbra_root)
+        pen_row.addWidget(pen_browse_btn)
+        root.addLayout(pen_row)
 
         # Existing PMP (merge target)
         pmp_row = QtWidgets.QHBoxLayout()
@@ -294,6 +318,8 @@ class ProteusPackagerPlugin:
         self._export_preset_combo.currentIndexChanged.connect(self._read_ui_settings)
         self._mutex_check.stateChanged.connect(self._read_ui_settings)
         self._auto_check.stateChanged.connect(self._read_ui_settings)
+        self._install_penumbra_check.stateChanged.connect(self._read_ui_settings)
+        self._penumbra_root_edit.editingFinished.connect(self._read_ui_settings)
         for edit in self._suffix_edits.values():
             edit.editingFinished.connect(self._read_ui_settings)
 
@@ -303,6 +329,15 @@ class ProteusPackagerPlugin:
         )
         if d:
             self._output_edit.setText(d)
+
+    def _browse_penumbra_root(self):
+        d = QtWidgets.QFileDialog.getExistingDirectory(
+            self._widget, "Select Penumbra Mod Root Directory",
+            self._penumbra_root_edit.text()
+        )
+        if d:
+            self._penumbra_root_edit.setText(d)
+            self._read_ui_settings()
 
     def _browse_existing_pmp(self):
         f, _ = QtWidgets.QFileDialog.getOpenFileName(
@@ -410,6 +445,8 @@ class ProteusPackagerPlugin:
         self._material_paths = self._material_edit.toPlainText().strip()
         self._mutually_exclusive = self._mutex_check.isChecked()
         self._auto_export = self._auto_check.isChecked()
+        self._install_to_penumbra = self._install_penumbra_check.isChecked()
+        self._penumbra_root = self._penumbra_root_edit.text().strip()
         for key, edit in self._suffix_edits.items():
             self._suffixes[key] = _split_csv(edit.text())
         self._save_settings()
@@ -453,6 +490,9 @@ class ProteusPackagerPlugin:
                           and os.path.isfile(merge_path)):
             self._log(f"Existing PMP not found or not a .pmp file: {merge_path}")
             return
+        if merge and self._install_to_penumbra:
+            self._log("Existing PMP is set — ignoring 'Install to Penumbra' and "
+                      "updating the pack in place.")
 
         tmpdir = tempfile.mkdtemp(prefix="proteus_pmp_")
         export_root = os.path.join(tmpdir, "_exports")  # intermediate SP exports
@@ -688,16 +728,31 @@ class ProteusPackagerPlugin:
                         "DefaultSettings": 0, "Options": opts,
                     })
 
-                # ZIP pmp_root → .pmp
-                out_dir = self._resolve_output_dir()
-                os.makedirs(out_dir, exist_ok=True)
-                zip_base = os.path.join(out_dir, mod_name)
-                archive = shutil.make_archive(zip_base, "zip", pmp_root)
-                pmp_path = zip_base + ".pmp"
-                if os.path.exists(pmp_path):
-                    os.remove(pmp_path)
-                os.rename(archive, pmp_path)
-                self._log(f"Done: {pmp_path}")
+                if self._install_to_penumbra:
+                    if not self._penumbra_root:
+                        self._log("Install to Penumbra is checked but no Penumbra "
+                                  "root directory is set.")
+                        return
+                    if not os.path.isdir(self._penumbra_root):
+                        self._log(f"Penumbra root directory not found: "
+                                  f"{self._penumbra_root}")
+                        return
+                    target = os.path.join(self._penumbra_root, mod_name)
+                    if os.path.isdir(target):
+                        shutil.rmtree(target)
+                    shutil.copytree(pmp_root, target)
+                    self._log(f"Installed to Penumbra: {target}")
+                else:
+                    # ZIP pmp_root → .pmp
+                    out_dir = self._resolve_output_dir()
+                    os.makedirs(out_dir, exist_ok=True)
+                    zip_base = os.path.join(out_dir, mod_name)
+                    archive = shutil.make_archive(zip_base, "zip", pmp_root)
+                    pmp_path = zip_base + ".pmp"
+                    if os.path.exists(pmp_path):
+                        os.remove(pmp_path)
+                    os.rename(archive, pmp_path)
+                    self._log(f"Done: {pmp_path}")
 
         except Exception as exc:
             self._log(f"Error: {exc}")
