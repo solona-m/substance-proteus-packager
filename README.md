@@ -78,9 +78,7 @@ Multiple texture sets work fine — the plugin walks all texture sets and builds
 | **Preset / Load** | Quick-load a saved set of material paths. Ships with a **Bibo+** preset. |
 | **Suffix mappings** | How exported filenames map to overlay types. Comma-separated, longest match wins. |
 | **Mutually exclusive options** | Checked → Penumbra group type `Single`; unchecked → `Multi`. |
-| **Auto-package when SP export finishes** | After any SP texture export completes, automatically trigger the layer-toggle packaging cycle. |
 | **Export PMP** | Manual trigger. |
-| **Log / Clear** | Timestamped activity log. |
 
 ### Suffix mappings
 

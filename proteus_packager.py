@@ -26,7 +26,6 @@ import struct
 import tempfile
 import zlib
 import configparser
-from datetime import datetime
 from pathlib import Path
 
 import substance_painter.ui
@@ -44,9 +43,9 @@ except ImportError:
     _HAS_LAYERSTACK = False
 
 try:
-    from PySide6 import QtWidgets, QtCore
+    from PySide6 import QtWidgets
 except ImportError:
-    from PySide2 import QtWidgets, QtCore
+    from PySide2 import QtWidgets
 
 
 PLUGIN_NAME = "Proteus Packager"
@@ -85,7 +84,6 @@ class ProteusPackagerPlugin:
         self._colorset_meta = ""
         self._export_preset = ""
         self._mutually_exclusive = True
-        self._auto_export = False
         self._install_to_penumbra = False
         self._material_paths = _BIBO_PLUS_PATHS
         self._suffixes = {
@@ -113,7 +111,6 @@ class ProteusPackagerPlugin:
         self._colorset_meta = g.get("ColorsetMeta", "")
         self._export_preset = g.get("ExportPreset", "")
         self._mutually_exclusive = cfg.getboolean("General", "MutuallyExclusive", fallback=True)
-        self._auto_export = cfg.getboolean("General", "AutoExport", fallback=False)
         self._install_to_penumbra = cfg.getboolean("General", "InstallToPenumbra", fallback=False)
 
         s = cfg["Suffixes"] if "Suffixes" in cfg else {}
@@ -142,7 +139,6 @@ class ProteusPackagerPlugin:
             "ColorsetMeta": self._colorset_meta,
             "ExportPreset": self._export_preset,
             "MutuallyExclusive": str(self._mutually_exclusive),
-            "AutoExport": str(self._auto_export),
             "InstallToPenumbra": str(self._install_to_penumbra),
         }
         cfg["Suffixes"] = {k: ",".join(v) for k, v in self._suffixes.items()}
@@ -279,26 +275,9 @@ class ProteusPackagerPlugin:
         self._mutex_check.setChecked(self._mutually_exclusive)
         root.addWidget(self._mutex_check)
 
-        self._auto_check = QtWidgets.QCheckBox("Auto-package when SP export finishes")
-        self._auto_check.setChecked(self._auto_export)
-        root.addWidget(self._auto_check)
-
         export_btn = QtWidgets.QPushButton("Export PMP")
         export_btn.clicked.connect(self._on_export_pmp_clicked)
         root.addWidget(export_btn)
-
-        log_label_row = QtWidgets.QHBoxLayout()
-        log_label_row.addWidget(QtWidgets.QLabel("Log"))
-        log_label_row.addStretch()
-        clear_btn = QtWidgets.QPushButton("Clear")
-        clear_btn.clicked.connect(self._clear_log)
-        log_label_row.addWidget(clear_btn)
-        root.addLayout(log_label_row)
-
-        self._log_edit = QtWidgets.QPlainTextEdit()
-        self._log_edit.setReadOnly(True)
-        self._log_edit.setFixedHeight(120)
-        root.addWidget(self._log_edit)
 
         substance_painter.ui.add_dock_widget(self._widget)
         self._connect_ui_autosave()
@@ -310,7 +289,6 @@ class ProteusPackagerPlugin:
         self._colorset_meta_edit.editingFinished.connect(self._read_ui_settings)
         self._export_preset_combo.currentIndexChanged.connect(self._read_ui_settings)
         self._mutex_check.stateChanged.connect(self._read_ui_settings)
-        self._auto_check.stateChanged.connect(self._read_ui_settings)
         self._install_penumbra_check.stateChanged.connect(self._read_ui_settings)
         for edit in self._suffix_edits.values():
             edit.editingFinished.connect(self._read_ui_settings)
@@ -345,9 +323,6 @@ class ProteusPackagerPlugin:
         if name in self._presets:
             self._material_edit.setPlainText(self._presets[name])
 
-    def _clear_log(self):
-        self._log_edit.clear()
-
     def _refresh_export_presets(self, select: str = ""):
         """Repopulate the export preset combo. select is a saved resource URL."""
         presets = _list_export_presets(log=self._log)
@@ -367,30 +342,11 @@ class ProteusPackagerPlugin:
         self._export_preset_combo.blockSignals(False)
 
     def _log(self, msg: str):
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        line = f"[{ts}] {msg}"
-        print(f"[ProteusPackager] {msg}")  # always visible in SP Python console
-        if not hasattr(self, "_log_edit") or self._log_edit is None:
-            return
-        try:
-            conn = QtCore.Qt.ConnectionType.QueuedConnection  # PySide6
-        except AttributeError:
-            conn = QtCore.Qt.QueuedConnection                 # PySide2
-        try:
-            QtCore.QMetaObject.invokeMethod(
-                self._log_edit, "appendPlainText", conn,
-                QtCore.Q_ARG(str, line),
-            )
-        except TypeError:
-            self._log_edit.appendPlainText(line)
+        print(f"[ProteusPackager] {msg}")
 
     # ── Events ────────────────────────────────────────────────────────────────
 
     def _connect_events(self):
-        substance_painter.event.DISPATCHER.connect(
-            substance_painter.event.ExportTexturesEnded,
-            self._on_sp_export_finished,
-        )
         for event_type in (
             substance_painter.event.ProjectOpened,
             substance_painter.event.ProjectCreated,
@@ -399,14 +355,6 @@ class ProteusPackagerPlugin:
 
     def _on_project_opened(self, _ev=None):
         self._refresh_export_presets(select=self._export_preset)
-
-    def _on_sp_export_finished(self, _res):
-        self._read_ui_settings()
-        if not self._auto_export:
-            return
-        if not substance_painter.project.is_open():
-            return
-        self._build_pmp()
 
     # ── Button handler ────────────────────────────────────────────────────────
 
@@ -427,7 +375,6 @@ class ProteusPackagerPlugin:
                                or self._export_preset_combo.currentText().strip())
         self._material_paths = self._material_edit.toPlainText().strip()
         self._mutually_exclusive = self._mutex_check.isChecked()
-        self._auto_export = self._auto_check.isChecked()
         self._install_to_penumbra = self._install_penumbra_check.isChecked()
         for key, edit in self._suffix_edits.items():
             self._suffixes[key] = _split_csv(edit.text())
@@ -798,10 +745,6 @@ class ProteusPackagerPlugin:
     # ── Cleanup ───────────────────────────────────────────────────────────────
 
     def cleanup(self):
-        substance_painter.event.DISPATCHER.disconnect(
-            substance_painter.event.ExportTexturesEnded,
-            self._on_sp_export_finished,
-        )
         for event_type in (
             substance_painter.event.ProjectOpened,
             substance_painter.event.ProjectCreated,
