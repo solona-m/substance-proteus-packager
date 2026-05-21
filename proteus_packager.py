@@ -291,10 +291,6 @@ class ProteusPackagerPlugin:
         self._mutex_check.setChecked(self._mutually_exclusive)
         root.addWidget(self._mutex_check)
 
-        export_btn = QtWidgets.QPushButton("Export PMP")
-        export_btn.clicked.connect(self._on_export_pmp_clicked)
-        root.addWidget(export_btn)
-
         preview_btn = QtWidgets.QPushButton("Generate previews")
         preview_btn.setToolTip(
             "For each option in the layer stack, switch to 3D-only view, "
@@ -303,6 +299,10 @@ class ProteusPackagerPlugin:
         )
         preview_btn.clicked.connect(self._on_generate_previews_clicked)
         root.addWidget(preview_btn)
+
+        export_btn = QtWidgets.QPushButton("Export PMP")
+        export_btn.clicked.connect(self._on_export_pmp_clicked)
+        root.addWidget(export_btn)
 
         substance_painter.ui.add_dock_widget(self._widget)
         self._connect_ui_autosave()
@@ -469,8 +469,8 @@ class ProteusPackagerPlugin:
                     if pm is None:
                         self._log(f"  [preview] Skipped {group}/{option} — no pixmap.")
                         continue
-                    sg = _safe_path_component(group)
-                    so = _safe_path_component(option)
+                    sg = _safe_path_component(group).lower()
+                    so = _safe_path_component(option).lower()
                     group_dir = os.path.join(per_opt_dir, sg)
                     os.makedirs(group_dir, exist_ok=True)
                     out = os.path.join(group_dir, so + ".png")
@@ -1823,25 +1823,26 @@ def _safe_path_component(name: str) -> str:
 
 
 def _option_preview_src(out_dir: str, mod_name: str, group: str, option: str) -> str:
-    """Where Generate Previews wrote the per-option preview PNG (may not exist)."""
+    """Where Generate Previews wrote the per-option preview PNG (may not exist).
+    Lowercase to match the casing the in-pack Image field expects."""
     return os.path.join(out_dir, mod_name,
-                        _safe_path_component(group),
-                        _safe_path_component(option) + ".png")
+                        _safe_path_component(group).lower(),
+                        _safe_path_component(option).lower() + ".png")
 
 
 def _maybe_copy_preview_into_pack(out_dir: str, mod_name: str,
                                   group: str, option: str,
                                   pmp_root: str) -> str:
     """If a preview PNG exists for (group, option), copy it into the pack at
-    images/<group>/<option>.png and return the forward-slash relative path
-    that goes into the Penumbra option's "Image" field. If no preview exists,
-    return ''."""
+    images/<group>/<option>.png (lowercased) and return the relative path that
+    goes into the Penumbra option's "Image" field. Returns '' if no preview."""
     src = _option_preview_src(out_dir, mod_name, group, option)
     if not os.path.isfile(src):
         return ""
-    sg = _safe_path_component(group)
-    so = _safe_path_component(option)
-    rel = f"images/{sg}/{so}.png"
+    sg = _safe_path_component(group).lower()
+    so = _safe_path_component(option).lower()
+    # Mixed separator matches Penumbra's canonical convention for this field.
+    rel = f"images\\{sg}/{so}.png"
     dst = os.path.join(pmp_root, "images", sg, so + ".png")
     os.makedirs(os.path.dirname(dst), exist_ok=True)
     shutil.copy2(src, dst)
