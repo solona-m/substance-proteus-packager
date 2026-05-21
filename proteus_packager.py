@@ -473,7 +473,7 @@ class ProteusPackagerPlugin:
         ts_names = [ts.name() for ts in all_ts]
 
         # 1. Discover structure from layer stack
-        structure, ts_node_map = _discover_structure(all_ts)
+        structure, ts_node_map, colorset_layers = _discover_structure(all_ts)
         if not structure:
             self._log("No group/option folder hierarchy found in the layer stack. "
                       "Add a top-level group folder (group) with sub-folders (options).")
@@ -646,10 +646,17 @@ class ProteusPackagerPlugin:
 
                     color_rows = (colorset_map.get((group, option))
                                   or colorset_map.get((None, option)))
-                    if color_rows is None:
-                        color_rows = [{"Row": 16, "SubRowA": {"Diffuse": "#FFFFFF"}}]
-                    elif self._colorset_meta:
+                    if color_rows is not None and self._colorset_meta:
                         self._log(f"  Colorset reused for '{option}'")
+                    if color_rows is None:
+                        entries = colorset_layers.get((group, option), [])
+                        if entries:
+                            self._log(f"  Colorset folder found for '{option}' ({len(entries)} layer(s))")
+                            color_rows = _rows_from_colorset_layers(entries, self._log)
+                            if color_rows:
+                                self._log(f"  Colorset produced {len(color_rows)} row(s) for '{option}'")
+                    if not color_rows:
+                        color_rows = [{"Row": 16, "SubRowA": {"Diffuse": "#FFFFFF"}}]
 
                     pro_entry = {
                         "Name": final_name,
@@ -829,12 +836,14 @@ def _discover_structure(all_ts: list):
     folder hierarchy.
 
     Returns:
-        structure:   dict[group_name → list[option_name]]  (insertion order)
-        ts_node_map: dict[ts_name → {"_top": [...], group_name: {"_node": node,
-                                                                   option_name: node}}]
+        structure:        dict[group_name → list[option_name]]  (insertion order)
+        ts_node_map:      dict[ts_name → {"_top": [...], group_name: {"_node": node,
+                                                                       option_name: node}}]
+        colorset_layers:  dict[(group, option) → list[(row, subrow, node)]]
     """
     structure: dict[str, list[str]] = {}
     ts_node_map: dict[str, dict] = {}
+    colorset_layers: dict = {}
 
     for ts in all_ts:
         ts_name = ts.name()
@@ -864,7 +873,21 @@ def _discover_structure(all_ts: list):
                     structure[group_name].append(opt_name)
                 ts_data[group_name][opt_name] = child
 
-    return structure, ts_node_map
+                # One level deeper: scan for a "Colorset" sub-folder of this option
+                for sub in _node_children(child):
+                    if not _is_group(sub):
+                        continue
+                    if not _COLORSET_FOLDER_RE.match(_node_name(sub) or ""):
+                        continue
+                    for layer in _node_children(sub):
+                        parsed = _parse_colorset_row_id(_node_name(layer) or "")
+                        if parsed is None:
+                            continue
+                        row, subrow = parsed
+                        colorset_layers.setdefault((group_name, opt_name), []) \
+                            .append((row, subrow, layer))
+
+    return structure, ts_node_map, colorset_layers
 
 
 def _set_visibility_for_option(ts_node_map: dict, group: str, option: str):
@@ -882,8 +905,15 @@ def _set_visibility_for_option(ts_node_map: dict, group: str, option: str):
 
             if is_target_group:
                 for child in _node_children(node):
-                    if _is_group(child):
-                        child.set_visible(_node_name(child) == option)
+                    if not _is_group(child):
+                        continue
+                    is_target_opt = _node_name(child) == option
+                    child.set_visible(is_target_opt)
+                    if is_target_opt:
+                        for sub in _node_children(child):
+                            if _is_group(sub) and _COLORSET_FOLDER_RE.match(_node_name(sub) or ""):
+                                for layer in _node_children(sub):
+                                    layer.set_visible(False)
 
 
 def _save_visibility(ts_node_map: dict) -> dict:
@@ -958,6 +988,378 @@ def _node_children(node) -> list:
         except Exception:
             continue
     return []
+
+
+# ── Colorset sub-folder helpers ───────────────────────────────────────────────
+
+_COLORSET_FOLDER_RE = re.compile(r"^\s*colorset\s*$", re.IGNORECASE)
+_COLORSET_ROW_RE    = re.compile(r"^\s*(\d{1,2})\s*([AB])\s*$", re.IGNORECASE)
+
+
+def _parse_colorset_row_id(name: str):
+    """Return (row:int, subrow:'A'|'B') or None when unparseable / out of range."""
+    if not name:
+        return None
+    m = _COLORSET_ROW_RE.match(name)
+    if not m:
+        return None
+    row = int(m.group(1))
+    if not 1 <= row <= 16:
+        return None
+    return row, m.group(2).upper()
+
+
+def _color_components(c):
+    """Return the SP Color's components as a list of floats in sRGB space.
+    Falls back to .value if conversion isn't available. Returns None if no
+    extraction path works."""
+    if c is None:
+        return None
+    # SP Color: convert(sRGB) returns a list of floats directly (NOT a Color).
+    try:
+        target = getattr(c, "sRGB", None)
+        convert = getattr(c, "convert", None)
+        if target is not None and callable(convert):
+            srgb = convert(target)
+            # In some versions srgb may itself be a Color with .value.
+            if hasattr(srgb, "value"):
+                v = srgb.value
+                v = v() if callable(v) else v
+                return [float(x) for x in v]
+            # Newer versions: srgb IS the list.
+            return [float(x) for x in srgb]
+    except Exception:
+        pass
+    # Fallback: raw .value (working / linear space)
+    try:
+        v = getattr(c, "value", None)
+        v = v() if callable(v) else v
+        if v is not None:
+            return [float(x) for x in v]
+    except Exception:
+        pass
+    # Plain sequence
+    try:
+        return [float(x) for x in c]
+    except Exception:
+        pass
+    return None
+
+
+def _color_to_rgb(c):
+    """Extract (r, g, b) floats from common SP / Qt / tuple color shapes."""
+    comps = _color_components(c)
+    if comps is not None and len(comps) >= 3:
+        return comps[0], comps[1], comps[2]
+    # Attribute-based: .r/.g/.b or .red/.green/.blue (last-resort)
+    for trio in (("r", "g", "b"), ("red", "green", "blue")):
+        try:
+            vals = []
+            for name in trio:
+                v = getattr(c, name)
+                v = v() if callable(v) else v
+                vals.append(float(v))
+            return tuple(vals)
+        except Exception:
+            continue
+    return None
+
+
+def _rgb_to_hex(c):
+    """Accept various SP color shapes; return '#RRGGBB' or None."""
+    rgb = _color_to_rgb(c)
+    if rgb is None:
+        return None
+    def _to8(v):
+        return max(0, min(255, int(round(v * 255 if v <= 1.0 else v))))
+    try:
+        return f"#{_to8(rgb[0]):02X}{_to8(rgb[1]):02X}{_to8(rgb[2]):02X}"
+    except Exception:
+        return None
+
+
+_CHANNEL_ALIASES = {
+    "diffuse":  ("basecolor", "diffuse", "albedo", "color", "base_color"),
+    "emissive": ("emissive", "emission", "emissivecolor", "emissive_color"),
+    "opacity":  ("opacity", "alpha"),
+}
+
+
+def _channel_label(ch) -> str:
+    """Best-effort string for a Channel object — its label, type name, or repr."""
+    for attr in ("label", "name"):
+        try:
+            v = getattr(ch, attr)
+            v = v() if callable(v) else v
+            if v:
+                return str(v)
+        except Exception:
+            continue
+    for attr in ("type", "channel_type"):
+        try:
+            v = getattr(ch, attr)
+            v = v() if callable(v) else v
+            if v is not None:
+                return getattr(v, "name", str(v))
+        except Exception:
+            continue
+    return repr(ch)
+
+
+def _active_channels(node):
+    """Return the iterable of active channel objects on a fill layer, or []."""
+    try:
+        v = getattr(node, "active_channels", None)
+        if v is None:
+            return []
+        if callable(v):
+            v = v()
+        return list(v)
+    except Exception:
+        return []
+
+
+def _source_value(src):
+    """Pull a uniform value (RGBA tuple or scalar) off an SP source object."""
+    if src is None:
+        return None
+    for attr in ("color", "color_rgba", "rgba", "value", "uniform_color",
+                 "base_color"):
+        try:
+            v = getattr(src, attr)
+            v = v() if callable(v) else v
+            if v is not None:
+                return v
+        except Exception:
+            continue
+    # set_source_uniform_color counterpart: some versions expose get_*
+    for getter in ("get_uniform_color", "get_color", "get_value"):
+        try:
+            fn = getattr(src, getter, None)
+            if callable(fn):
+                v = fn()
+                if v is not None:
+                    return v
+        except Exception:
+            continue
+    return None
+
+
+def _node_fill_channel_raw(node, kind: str, log=None):
+    """Read a fill layer's channel value (RGBA tuple for colors, scalar/list
+    for Opacity).  `kind` is one of 'diffuse', 'emissive', 'opacity' and is
+    matched against the actual channel label/type, since the ChannelType
+    enum lives in different modules across SP versions."""
+    aliases = _CHANNEL_ALIASES.get(kind, (kind,))
+    matched_channel = None
+    for ch in _active_channels(node):
+        label = _channel_label(ch).lower().replace(" ", "").replace("_", "")
+        if any(a.replace("_", "") in label or label in a.replace("_", "")
+               for a in aliases):
+            matched_channel = ch
+            break
+    # Try get_source with the matched channel object (Split mode)
+    if matched_channel is not None:
+        fn = getattr(node, "get_source", None)
+        if callable(fn):
+            try:
+                v = _source_value(fn(matched_channel))
+                if v is not None:
+                    return v
+            except Exception:
+                pass
+    # Non-Split mode: get_source() with no argument returns a single source
+    # used for every channel.
+    fn = getattr(node, "get_source", None)
+    if callable(fn):
+        try:
+            v = _source_value(fn())
+            if v is not None:
+                return v
+        except Exception:
+            pass
+    # Material-mode fill layers expose a material source instead.
+    fn = getattr(node, "get_material_source", None)
+    if callable(fn):
+        try:
+            ms = fn()
+            v = _source_value(ms)
+            if v is not None:
+                return v
+            # Some material sources have per-channel sub-sources
+            if matched_channel is not None:
+                for getter in ("get_source", "get_channel_source"):
+                    g = getattr(ms, getter, None)
+                    if callable(g):
+                        try:
+                            v = _source_value(g(matched_channel))
+                            if v is not None:
+                                return v
+                        except Exception:
+                            continue
+        except Exception:
+            pass
+    return None
+
+
+def _read_color_channel(node, kind, log=None):
+    """Pull a hex color string for a color channel ('diffuse' or 'emissive'),
+    or None if SP returned nothing for that channel."""
+    raw = _node_fill_channel_raw(node, kind, log)
+    if raw is None:
+        return None
+    hexv = _rgb_to_hex(raw)
+    if hexv is None and log:
+        log(f"  [colorset-debug] got {kind} value but couldn't parse: "
+            f"type={type(raw).__name__} attrs="
+            f"{[a for a in dir(raw) if not a.startswith('_')][:15]}")
+        _probe_color(raw, log)
+    return hexv
+
+
+def _probe_color(c, log):
+    """Diagnostic: try every plausible Color accessor and log shape/repr."""
+    for attr in ("value", "value_raw", "color_space", "sRGB", "working"):
+        try:
+            v = getattr(c, attr)
+            if callable(v):
+                try:
+                    called = v()
+                    log(f"  [colorset-probe] {attr}() -> {type(called).__name__}: "
+                        f"{repr(called)[:120]}")
+                except Exception as e:
+                    log(f"  [colorset-probe] {attr}() raised: "
+                        f"{type(e).__name__}: {e}")
+            else:
+                log(f"  [colorset-probe] {attr} attr -> {type(v).__name__}: "
+                    f"{repr(v)[:120]}")
+        except Exception as e:
+            log(f"  [colorset-probe] {attr} lookup raised: "
+                f"{type(e).__name__}: {e}")
+    convert = getattr(c, "convert", None)
+    if callable(convert):
+        target = getattr(c, "sRGB", None)
+        if callable(target):
+            try:
+                target = target()
+            except Exception:
+                target = None
+        try:
+            conv = convert(target) if target is not None else convert()
+            log(f"  [colorset-probe] convert(sRGB) -> {type(conv).__name__}: "
+                f"attrs={[a for a in dir(conv) if not a.startswith('_')][:15]}")
+            for a in ("value", "value_raw"):
+                try:
+                    v = getattr(conv, a)
+                    v = v() if callable(v) else v
+                    log(f"  [colorset-probe] convert(sRGB).{a} -> "
+                        f"{type(v).__name__}: {repr(v)[:120]}")
+                except Exception as e:
+                    log(f"  [colorset-probe] convert(sRGB).{a} raised: "
+                        f"{type(e).__name__}: {e}")
+        except Exception as e:
+            log(f"  [colorset-probe] convert(sRGB) raised: "
+                f"{type(e).__name__}: {e}")
+
+
+def _node_fill_base_color(node, log=None):
+    return _read_color_channel(node, "diffuse", log)
+
+
+def _node_fill_emissive(node, log=None):
+    """Return emissive intensity (0-1 float) or None.
+    Proteus stores Emissive as a scalar intensity, not a color — collapse the
+    SP Emissive channel's uniform color to its luminance."""
+    raw = _node_fill_channel_raw(node, "emissive", log)
+    comps = _color_components(raw)
+    if not comps:
+        return None
+    if len(comps) == 1:
+        return max(0.0, min(1.0, comps[0]))
+    r = comps[0]
+    g = comps[1] if len(comps) > 1 else r
+    b = comps[2] if len(comps) > 2 else r
+    lum = 0.2126 * r + 0.7152 * g + 0.0722 * b
+    return max(0.0, min(1.0, lum))
+
+
+def _node_fill_opacity(node, log=None):
+    """Return Proteus Opacity adjustment as an int in [-100, 100].
+    Proteus's Opacity is a *delta* on the .mtrl's existing opacity, not an
+    absolute value: 0 = leave alone, -100 = fully transparent, +100 = fully
+    opaque. The SP Opacity channel's slider (0..1) naturally maps to the
+    negative half: slider 1.0 → 0 (no change), slider 0.0 → -100. Above 1
+    would map to positive, but SP's UI caps at 1."""
+    raw = _node_fill_channel_raw(node, "opacity", log)
+    comps = _color_components(raw)
+    if not comps:
+        return None
+    v = comps[0]
+    return max(-100, min(100, int(round((v - 1.0) * 100))))
+
+
+def _diagnose_fill_layer(node, log):
+    """Dump what SP exposes on this node so we can refine the channel shim."""
+    try:
+        node_type = getattr(node, "get_type", lambda: type(node).__name__)
+        node_type = node_type() if callable(node_type) else node_type
+        log(f"  [colorset-debug] node type: {node_type}")
+    except Exception as e:
+        log(f"  [colorset-debug] node type lookup failed: {e}")
+    try:
+        mode = getattr(node, "source_mode", None)
+        mode = mode() if callable(mode) else mode
+        log(f"  [colorset-debug] source_mode: {mode}")
+    except Exception as e:
+        log(f"  [colorset-debug] source_mode lookup failed: {e}")
+    chans = _active_channels(node)
+    log(f"  [colorset-debug] active_channels ({len(chans)}): "
+        f"{[_channel_label(c) for c in chans]}")
+    fn = getattr(node, "get_source", None)
+    if callable(fn):
+        for ch in chans + [None]:
+            try:
+                src = fn(ch) if ch is not None else fn()
+                log(f"  [colorset-debug] get_source({_channel_label(ch) if ch else '∅'}) "
+                    f"-> {type(src).__name__}: attrs="
+                    f"{[a for a in dir(src) if not a.startswith('_')][:25]}")
+            except Exception as e:
+                log(f"  [colorset-debug] get_source({_channel_label(ch) if ch else '∅'}) "
+                    f"raised: {type(e).__name__}: {e}")
+    ms_fn = getattr(node, "get_material_source", None)
+    if callable(ms_fn):
+        try:
+            ms = ms_fn()
+            log(f"  [colorset-debug] get_material_source() -> {type(ms).__name__}: "
+                f"attrs={[a for a in dir(ms) if not a.startswith('_')][:25]}")
+        except Exception as e:
+            log(f"  [colorset-debug] get_material_source() raised: "
+                f"{type(e).__name__}: {e}")
+
+
+def _rows_from_colorset_layers(entries, log=None):
+    """entries: iterable of (row:int, subrow:'A'|'B', node).
+    Coalesce by Row; SubRowA / SubRowB go on the same dict.
+    Multi-TS policy: UNION, last-write-wins per (row, subrow)."""
+    by_row: dict = {}
+    diagnosed = False
+    for row, subrow, node in entries:
+        diffuse  = _node_fill_base_color(node, log)
+        emissive = _node_fill_emissive(node, log)
+        opacity  = _node_fill_opacity(node, log)
+        if diffuse is None and emissive is None and opacity is None:
+            if log:
+                log(f"  [colorset] Skipping {row}{subrow}: no readable channels")
+                if not diagnosed:
+                    _diagnose_fill_layer(node, log)
+                    diagnosed = True
+            continue
+        sub: dict = {}
+        if diffuse  is not None: sub["Diffuse"]  = diffuse
+        if emissive is not None: sub["Emissive"] = round(emissive, 4)
+        if opacity  is not None: sub["Opacity"]  = opacity
+        by_row.setdefault(row, {"Row": row})[f"SubRow{subrow}"] = sub
+    return [by_row[r] for r in sorted(by_row)]
 
 
 # ── Misc helpers ──────────────────────────────────────────────────────────────
