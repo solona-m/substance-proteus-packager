@@ -680,6 +680,8 @@ class ProteusPackagerPlugin:
                         shutil.rmtree(target)
                     shutil.copytree(pmp_root, target)
                     self._log(f"Installed to Penumbra: {target}")
+                    if _reload_penumbra_mod(target, name=mod_name, log=self._log):
+                        self._log(f"Reloaded in Penumbra: {mod_name}")
                 else:
                     # ZIP pmp_root → .pmp
                     out_dir = self._resolve_output_dir()
@@ -1290,6 +1292,37 @@ def _rows_from_colorset_layers(entries, log=None):
 
 
 # ── Penumbra root auto-detect ─────────────────────────────────────────────────
+
+def _reload_penumbra_mod(path: str, name: str = "", log=None) -> bool:
+    """POST to Penumbra's HTTP API to reload a mod in place. Both Path and Name are
+    optional from Penumbra's side; we send Path (the on-disk folder) and Name
+    (the mod's directory name) so Penumbra can find it either way.
+    Returns True on HTTP 2xx; logs and returns False otherwise."""
+    import urllib.request
+    body = {}
+    if path:
+        body["Path"] = path
+    if name:
+        body["Name"] = name
+    data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(
+        "http://localhost:42069/api/reloadmod",
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            if 200 <= resp.status < 300:
+                return True
+            if log:
+                log(f"Penumbra /reloadmod returned HTTP {resp.status}")
+            return False
+    except Exception as exc:
+        if log:
+            log(f"Penumbra /reloadmod failed (is the game running?): {exc}")
+        return False
+
 
 def _read_penumbra_root_from_xivlauncher(log=None) -> str:
     """Return the `ModDirectory` value from XIVLauncher's Penumbra config, or
