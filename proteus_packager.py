@@ -43,9 +43,9 @@ except ImportError:
     _HAS_LAYERSTACK = False
 
 try:
-    from PySide6 import QtWidgets
+    from PySide6 import QtWidgets, QtCore, QtGui
 except ImportError:
-    from PySide2 import QtWidgets
+    from PySide2 import QtWidgets, QtCore, QtGui
 
 
 PLUGIN_NAME = "Proteus Packager"
@@ -97,6 +97,8 @@ class ProteusPackagerPlugin:
         self._load_settings()
         self._create_ui()
         self._connect_events()
+        # Defer the network check so the dock paints first.
+        QtCore.QTimer.singleShot(0, self._check_for_plugin_update)
 
     # ── Settings ──────────────────────────────────────────────────────────────
 
@@ -158,6 +160,20 @@ class ProteusPackagerPlugin:
         root = QtWidgets.QVBoxLayout(self._widget)
         root.setContentsMargins(8, 8, 8, 8)
         root.setSpacing(6)
+
+        # Update banner — hidden unless a newer plugin.py exists on GitHub.
+        self._update_btn = QtWidgets.QPushButton()
+        self._update_btn.setVisible(False)
+        self._update_btn.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
+        self._update_btn.setStyleSheet(
+            "QPushButton { text-align: left; color: #f7c948; padding: 6px 10px; "
+            "border: 1px solid #f7c948; border-radius: 3px; "
+            "background: transparent; }"
+            "QPushButton:hover { background: rgba(247, 201, 72, 0.15); }"
+            "QPushButton:disabled { color: #6aa84f; border-color: #6aa84f; }"
+        )
+        self._update_btn.clicked.connect(self._apply_plugin_update)
+        root.addWidget(self._update_btn)
 
         # Author
         author_row = QtWidgets.QHBoxLayout()
@@ -355,6 +371,44 @@ class ProteusPackagerPlugin:
 
     def _on_project_opened(self, _ev=None):
         self._refresh_export_presets(select=self._export_preset)
+
+    # ── Update check ──────────────────────────────────────────────────────────
+
+    def _check_for_plugin_update(self):
+        """Compare the published plugin file's Last-Modified timestamp on
+        GitHub against this file's on-disk mtime. If GitHub is newer, reveal
+        the update banner."""
+        remote_mtime = _remote_last_modified()
+        if remote_mtime is None:
+            return
+        try:
+            local_mtime = os.path.getmtime(__file__)
+        except Exception:
+            return
+        # 60s grace so trivial drift / clock skew doesn't fire spuriously.
+        if remote_mtime > local_mtime + 60:
+            self._update_btn.setText("⚠ Update available — click to install")
+            self._update_btn.setVisible(True)
+            self._log(f"Update available: {_PLUGIN_REMOTE_URL}")
+
+    def _apply_plugin_update(self):
+        content = _fetch_remote_file(_PLUGIN_REMOTE_URL)
+        if content is None:
+            self._update_btn.setText("Update failed — see Python console")
+            return
+        try:
+            target = os.path.abspath(__file__)
+            tmp = target + ".tmp"
+            with open(tmp, "wb") as f:
+                f.write(content)
+            os.replace(tmp, target)
+        except Exception as exc:
+            self._update_btn.setText(f"Update failed: {exc}")
+            self._log(f"Plugin update write failed: {exc}")
+            return
+        self._update_btn.setText("✓ Updated — Python > Reload All Plugins")
+        self._update_btn.setEnabled(False)
+        self._log(f"Plugin file updated: {target}")
 
     # ── Button handler ────────────────────────────────────────────────────────
 
@@ -1292,6 +1346,49 @@ def _rows_from_colorset_layers(entries, log=None):
 
 
 # ── Penumbra root auto-detect ─────────────────────────────────────────────────
+
+# ── Plugin self-update ────────────────────────────────────────────────────────
+
+_PLUGIN_REMOTE_URL = (
+    "https://raw.githubusercontent.com/solona-m/substance-proteus-packager/"
+    "main/proteus_packager.py"
+)
+_PLUGIN_COMMITS_API = (
+    "https://api.github.com/repos/solona-m/substance-proteus-packager/"
+    "commits?path=proteus_packager.py&per_page=1"
+)
+
+
+def _remote_last_modified(timeout: float = 3.0):
+    """Return the latest commit's Unix timestamp for the published plugin
+    file via the GitHub commits API, or None on any failure. (raw.github
+    doesn't expose a Last-Modified header.)"""
+    import urllib.request
+    from datetime import datetime
+    try:
+        req = urllib.request.Request(
+            _PLUGIN_COMMITS_API,
+            headers={"Accept": "application/vnd.github+json"},
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read())
+        if not data:
+            return None
+        iso = data[0]["commit"]["committer"]["date"]  # e.g. "2026-05-21T16:17:09Z"
+        return datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return None
+
+
+def _fetch_remote_file(url: str, timeout: float = 10.0):
+    """Return remote file content as bytes, or None on failure."""
+    import urllib.request
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            return resp.read()
+    except Exception:
+        return None
+
 
 def _reload_penumbra_mod(path: str, name: str = "", log=None) -> bool:
     """POST to Penumbra's HTTP API to reload a mod in place. Both Path and Name are
