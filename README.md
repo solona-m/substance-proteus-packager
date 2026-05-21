@@ -21,7 +21,7 @@ When you click **Export PMP** the plugin:
 1. Hides all layers.
 2. For each option folder, shows only that folder and runs SP's export to a temporary directory using your configured output template.
 3. Restores original layer visibility.
-4. Packages everything into `<ProjectName>.pmp`.
+4. Either zips everything into `<ProjectName>.pmp` in your output directory, merges the exported options into an existing `.pmp` (when **Existing PMP** is set), or copies the mod folder straight into Penumbra (when **Install to Penumbra** is checked).
 
 Each option is exported in isolation so the textures contain only that option's artwork.
 
@@ -69,9 +69,11 @@ Multiple texture sets work fine — the plugin walks all texture sets and builds
 | Setting | Description |
 |---|---|
 | **Author** | Written into `meta.json` and `Proteus/metadata.json`. |
-| **Output Dir** | Where the `.pmp` is saved. Defaults to the SP project's directory. Ignored in merge mode. |
+| **Output Dir** | Where the `.pmp` is saved. Defaults to the SP project's directory. Ignored in merge mode and when **Install to Penumbra** is checked. |
+| **Install to Penumbra** | When checked, copy the mod folder directly into your Penumbra mod root (loose, not zipped) instead of producing a `.pmp`. Penumbra picks it up when you refresh the mod (under edit mod). |
+| **Penumbra Root** | The Penumbra mod root directory (the folder containing one sub-folder per installed mod). Used only when **Install to Penumbra** is checked. |
 | **Existing PMP** | Optional. Leave blank to build a fresh pack. If set to an existing `.pmp`, the newly exported groups/options are merged into that pack (see [Merging](#merging-into-an-existing-pmp)). |
-| **Colorset metadata** | Optional. Select an existing Proteus `metadata.json`; exported options reuse its `ColorTableRows` (matched by option name) instead of the default white colorset. |
+| **Colorset metadata** | Optional. Select an existing Proteus `metadata.json`; exported options reuse its `ColorTableRows` (matched by option name) instead of the default white colorset. Takes precedence over any in-project [Colorset sub-folder](#colorset-sub-folder). |
 | **Export Preset** | Dropdown listing all available SP output templates. Select **[User] Proteus** when using the included template. Use **↻** to refresh after installing new templates. |
 | **Material Game Paths** | One Penumbra game path per line. All listed materials receive the overlay. |
 | **Preset / Load** | Quick-load a saved set of material paths. Ships with a **Bibo+** preset. |
@@ -100,9 +102,43 @@ For other templates you can configure custom suffixes (e.g. `_d`, `_n`, `_id`, `
 chara/human/c0201/obj/body/b0001/material/v0001/mt_c0201b0001_bibo.mtrl
 chara/human/c0401/obj/body/b0001/material/v0001/mt_c0401b0001_bibo.mtrl
 chara/human/c1401/obj/body/b0001/material/v0001/mt_c1401b0001_bibo.mtrl
+chara/human/c1401/obj/body/b0001/material/v0001/mt_c1401b0101_bibo.mtrl
 chara/human/c1801/obj/body/b0001/material/v0001/mt_c1801b0001_bibo.mtrl
 chara/human/c1601/obj/body/b0001/material/v0001/mt_c1601b0001_bibo.mtrl
 ```
+
+Edit the list before exporting to add/remove races or to target a different mesh body.
+
+---
+
+## Colorset sub-folder
+
+You can author per-option dye rows directly inside your SP layer stack — no external `metadata.json` required.
+
+If an option folder contains a sub-folder literally named **`Colorset`** (case-insensitive), each fill layer inside it becomes one entry in that option's `ColorTableRows`:
+
+- The **layer name** identifies the affected row, e.g. `16A`, `16B`, `1a` (case-insensitive). Valid rows are 1–16; sub-row is `A` or `B`. Layers with names that don't match this pattern are silently skipped.
+- The fill layer's **BaseColor** → `Diffuse` (sRGB hex string).
+- The fill layer's **Emissive** channel → `Emissive` (float intensity 0–1, derived from the channel color's luminance). Toggle the Emissive channel on the layer to use it.
+- The fill layer's **Opacity** channel slider → `Opacity` (integer adjustment, −100…0). Slider at 1.0 → `0` (no change); slider at 0.5 → `-50` (fade 50% toward transparent); slider at 0.0 → `-100` (fully transparent). Toggle the Opacity channel on the layer to use it.
+
+Channels that aren't active on the layer are simply omitted from that sub-row. Layers `16A` and `16B` are coalesced into a single `Row 16` entry with both `SubRowA` and `SubRowB` populated.
+
+```
+Body
+└── Style                  ← group
+    └── Roses              ← option
+        ├── Colorset       ← (case-insensitive) — drives ColorTableRows
+        │   ├── 1A         ← fill layer, base color = dye for row 1 sub-row A
+        │   ├── 16A        ← fill layer, base color = dye for row 16 sub-row A
+        │   └── 16B        ← fill layer, base color = dye for row 16 sub-row B
+        ├── roses_diffuse  ← regular paint/fill content (exported as textures)
+        └── roses_normal
+```
+
+Colorset layers are **hidden automatically during that option's texture export** so the dye-preview colors never bleed into the diffuse PNG. Their pre-export visibility is restored when the export finishes.
+
+**Precedence:** if the **Colorset metadata** picker is also set and supplies rows for the same option, the picker wins and the in-project Colorset folder is ignored for that option. If neither is configured, the option falls back to a single white row 16.
 
 ---
 
@@ -125,6 +161,8 @@ MyMod.pmp  (renamed .zip)
             ├── diffuse.png
             └── normal.png
 ```
+
+Every exported PNG receives a small `tEXt` chunk stamped with its option's path (e.g. `Style/Roses`). Penumbra auto-deduplicates identical files, which would otherwise collapse pixel-identical index/mask textures across options into a single file and break per-option overlays. The stamp keeps the pixel data identical but the file bytes distinct, so Penumbra leaves each option's textures alone.
 
 ---
 
