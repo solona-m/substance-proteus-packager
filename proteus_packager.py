@@ -1049,33 +1049,52 @@ def _grab_viewport_pixmap(log=None):
         return None
 
 
-def _composite_preview_grid(tiles, out_path, tile_w=256, label_h=24, log=None):
-    """tiles: list of (label:str, QPixmap). Save a near-square grid PNG to
-    out_path. Returns True on success."""
+def _composite_preview_grid(tiles, out_path, canvas_w=1920, canvas_h=1080,
+                            tile_w=256, label_h=24, log=None):
+    """tiles: list of (label:str, QPixmap). Save a fixed 16:9 (canvas_w x
+    canvas_h) grid PNG to out_path. Columns/rows are chosen to sit as close to
+    the canvas aspect as the tile count allows; the grid is scaled to fit and
+    centered, with the empty margin letterboxed. Returns True on success."""
     if not tiles:
         return False
     import math
-    cols = max(1, math.ceil(math.sqrt(len(tiles))))
-    rows = math.ceil(len(tiles) / cols)
-    cell_h = tile_w + label_h
-    canvas = QtGui.QPixmap(cols * tile_w, rows * cell_h)
+    n = len(tiles)
+    # A cell is a square tile plus a label strip beneath it; keep that strip
+    # proportional to the tile so it scales cleanly at any output size.
+    label_ratio = label_h / tile_w
+    cell_h_units = 1.0 + label_ratio          # cell height in tile-width units
+    target_aspect = canvas_w / canvas_h
+    # cols/rows that best match the canvas aspect: solve cols/(rows*cell_h_units)
+    # ≈ target_aspect with rows ≈ n/cols.
+    cols = max(1, min(n, round(math.sqrt(n * target_aspect * cell_h_units))))
+    rows = math.ceil(n / cols)
+    # Largest tile size that fits the whole grid inside the canvas.
+    tile = min(canvas_w / cols, canvas_h / (rows * cell_h_units))
+    lab = tile * label_ratio
+    cell_h = tile + lab
+    off_x = (canvas_w - cols * tile) / 2.0
+    off_y = (canvas_h - rows * cell_h) / 2.0
+
+    canvas = QtGui.QPixmap(canvas_w, canvas_h)
     canvas.fill(QtGui.QColor(32, 32, 32))
     painter = QtGui.QPainter(canvas)
     try:
         font = painter.font()
-        font.setPointSize(9)
+        font.setPointSize(max(7, round(tile * 9 / tile_w)))
         painter.setFont(font)
         painter.setPen(QtGui.QColor(220, 220, 220))
         for i, (label, pm) in enumerate(tiles):
             col, row = i % cols, i // cols
-            x, y = col * tile_w, row * cell_h
-            scaled = pm.scaled(tile_w, tile_w,
+            x = int(off_x + col * tile)
+            y = int(off_y + row * cell_h)
+            t = int(tile)
+            scaled = pm.scaled(t, t,
                                QtCore.Qt.KeepAspectRatio,
                                QtCore.Qt.SmoothTransformation)
-            ox = x + (tile_w - scaled.width()) // 2
-            oy = y + (tile_w - scaled.height()) // 2
+            ox = x + (t - scaled.width()) // 2
+            oy = y + (t - scaled.height()) // 2
             painter.drawPixmap(ox, oy, scaled)
-            painter.drawText(QtCore.QRect(x, y + tile_w, tile_w, label_h),
+            painter.drawText(QtCore.QRect(x, y + t, t, int(lab)),
                              QtCore.Qt.AlignCenter, label)
     finally:
         painter.end()
