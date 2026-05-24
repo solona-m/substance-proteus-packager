@@ -82,6 +82,7 @@ class ProteusPackagerPlugin:
         self._output_dir = ""
         self._existing_pmp = ""
         self._colorset_meta = ""
+        self._colorset_meta_manual = False
         self._export_preset = ""
         self._mutually_exclusive = True
         self._install_to_penumbra = False
@@ -111,6 +112,8 @@ class ProteusPackagerPlugin:
         self._output_dir = g.get("OutputDir", "")
         self._existing_pmp = g.get("ExistingPmp", "")
         self._colorset_meta = g.get("ColorsetMeta", "")
+        self._colorset_meta_manual = cfg.getboolean(
+            "General", "ColorsetMetaManual", fallback=False)
         self._export_preset = g.get("ExportPreset", "")
         self._mutually_exclusive = cfg.getboolean("General", "MutuallyExclusive", fallback=True)
         self._install_to_penumbra = cfg.getboolean("General", "InstallToPenumbra", fallback=False)
@@ -139,6 +142,7 @@ class ProteusPackagerPlugin:
             "OutputDir": self._output_dir,
             "ExistingPmp": self._existing_pmp,
             "ColorsetMeta": self._colorset_meta,
+            "ColorsetMetaManual": str(self._colorset_meta_manual),
             "ExportPreset": self._export_preset,
             "MutuallyExclusive": str(self._mutually_exclusive),
             "InstallToPenumbra": str(self._install_to_penumbra),
@@ -222,20 +226,30 @@ class ProteusPackagerPlugin:
         pmp_row.addWidget(pmp_browse_btn)
         root.addLayout(pmp_row)
 
-        # Colorset metadata.json (pull ColorTableRows from an existing pack)
+        # Colorset metadata.json — auto-detected from the installed Penumbra
+        # mod matching the Substance project, but freely overridable by typing
+        # a path or browsing; ↻ clears the override and re-detects.
         cset_row = QtWidgets.QHBoxLayout()
         cset_row.addWidget(QtWidgets.QLabel("Colorset metadata"))
         self._colorset_meta_edit = QtWidgets.QLineEdit(self._colorset_meta)
         self._colorset_meta_edit.setToolTip(
-            "Optional. Select an existing Proteus metadata.json; exported "
-            "options reuse its ColorTableRows (matched by option name) "
-            "instead of the default white colorset."
+            "Auto-detected from the installed Penumbra mod matching the "
+            "Substance project name (its Proteus/metadata.json); options reuse "
+            "its ColorTableRows by name. Type or browse to override; press ↻ "
+            "to clear the override and re-detect."
         )
         cset_row.addWidget(self._colorset_meta_edit)
         cset_browse_btn = QtWidgets.QPushButton("...")
         cset_browse_btn.setFixedWidth(30)
+        cset_browse_btn.setToolTip("Browse for a Proteus metadata.json (override)")
         cset_browse_btn.clicked.connect(self._browse_colorset_meta)
         cset_row.addWidget(cset_browse_btn)
+        cset_redetect_btn = QtWidgets.QPushButton("↻")
+        cset_redetect_btn.setFixedWidth(28)
+        cset_redetect_btn.setToolTip(
+            "Clear override and re-detect from the matching installed Penumbra mod")
+        cset_redetect_btn.clicked.connect(self._redetect_colorset_meta)
+        cset_row.addWidget(cset_redetect_btn)
         root.addLayout(cset_row)
 
         # Export Preset
@@ -306,12 +320,20 @@ class ProteusPackagerPlugin:
 
         substance_painter.ui.add_dock_widget(self._widget)
         self._connect_ui_autosave()
+        # Reflect the auto-detected colorset source on open, unless the user
+        # has a saved manual override (which is kept as-is).
+        if not self._colorset_meta_manual:
+            self._colorset_meta = self._resolve_colorset_meta()
+            self._colorset_meta_edit.setText(self._colorset_meta)
 
     def _connect_ui_autosave(self):
         self._author_edit.editingFinished.connect(self._read_ui_settings)
         self._output_edit.editingFinished.connect(self._read_ui_settings)
         self._existing_pmp_edit.editingFinished.connect(self._read_ui_settings)
         self._colorset_meta_edit.editingFinished.connect(self._read_ui_settings)
+        # Typing in the field marks it as a manual override (programmatic
+        # setText does not emit textEdited, so auto-detection won't flip this).
+        self._colorset_meta_edit.textEdited.connect(self._on_colorset_meta_edited)
         self._export_preset_combo.currentIndexChanged.connect(self._read_ui_settings)
         self._mutex_check.stateChanged.connect(self._read_ui_settings)
         self._install_penumbra_check.stateChanged.connect(self._read_ui_settings)
@@ -334,14 +356,57 @@ class ProteusPackagerPlugin:
             self._existing_pmp_edit.setText(f)
             self._read_ui_settings()
 
+    def _on_colorset_meta_edited(self, _text):
+        # User typed into the field — treat it as a manual override.
+        self._colorset_meta_manual = True
+
     def _browse_colorset_meta(self):
         f, _ = QtWidgets.QFileDialog.getOpenFileName(
             self._widget, "Select Proteus metadata.json",
             self._colorset_meta_edit.text(), "Proteus metadata (*.json)"
         )
         if f:
+            self._colorset_meta_manual = True
             self._colorset_meta_edit.setText(f)
             self._read_ui_settings()
+
+    def _redetect_colorset_meta(self):
+        # Drop any manual override and re-run auto-detection.
+        self._colorset_meta_manual = False
+        self._colorset_meta = self._resolve_colorset_meta()
+        self._colorset_meta_edit.setText(self._colorset_meta)
+        self._read_ui_settings()
+
+    def _resolve_colorset_meta(self) -> str:
+        """Locate the Proteus metadata.json to reuse colorsets from.
+
+        Matches an installed Penumbra mod folder against the current Substance
+        project name and returns its Proteus/metadata.json. Returns '' if no
+        project is open, the Penumbra root can't be read, or no matching mod
+        has a Proteus/metadata.json."""
+        try:
+            if not substance_painter.project.is_open():
+                return ""
+            mod_name = (substance_painter.project.name() or "").strip()
+        except Exception:
+            return ""
+        if not mod_name:
+            return ""
+        penumbra_root = _read_penumbra_root_from_xivlauncher()
+        if not penumbra_root or not os.path.isdir(penumbra_root):
+            return ""
+        # Exact folder name first, then a case-insensitive match.
+        candidates = [mod_name]
+        try:
+            candidates += [d for d in os.listdir(penumbra_root)
+                           if d.lower() == mod_name.lower() and d != mod_name]
+        except OSError:
+            pass
+        for folder in candidates:
+            meta = os.path.join(penumbra_root, folder, "Proteus", "metadata.json")
+            if os.path.isfile(meta):
+                return meta
+        return ""
 
     def _load_mat_preset(self):
         name = self._mat_preset_combo.currentText()
@@ -495,6 +560,8 @@ class ProteusPackagerPlugin:
         self._author = self._author_edit.text().strip()
         self._output_dir = self._output_edit.text().strip()
         self._existing_pmp = self._existing_pmp_edit.text().strip()
+        # Persist whatever the field shows (auto-filled or a manual override);
+        # the manual flag is maintained by the edit/browse/re-detect handlers.
         self._colorset_meta = self._colorset_meta_edit.text().strip()
         # Prefer the stored URL (item data); fall back to typed text for manual entry
         self._export_preset = (self._export_preset_combo.currentData()
@@ -585,12 +652,16 @@ class ProteusPackagerPlugin:
             option_images: dict = {}         # (group, option) -> rel image path
 
             colorset_map: dict = {}
-            if self._colorset_meta:
-                if os.path.isfile(self._colorset_meta):
-                    colorset_map = _load_colorset_map(self._colorset_meta, log=self._log)
-                    self._log(f"Loaded colorsets from {self._colorset_meta}")
+            # Manual override wins; otherwise re-detect fresh for this project
+            # so a stale auto-filled path can never bleed across projects.
+            colorset_src = (self._colorset_meta if self._colorset_meta_manual
+                            else self._resolve_colorset_meta())
+            if colorset_src:
+                if os.path.isfile(colorset_src):
+                    colorset_map = _load_colorset_map(colorset_src, log=self._log)
+                    self._log(f"Loaded colorsets from {colorset_src}")
                 else:
-                    self._log(f"Colorset metadata not found: {self._colorset_meta}")
+                    self._log(f"Colorset metadata not found: {colorset_src}")
 
             # Merge-mode: load existing Proteus/Penumbra content to append to
             proteus_meta = None
@@ -753,9 +824,8 @@ class ProteusPackagerPlugin:
                         "Description": "", "Version": "1.0", "Website": "",
                         "ModTags": [],
                     })
-                if not os.path.isfile(os.path.join(pmp_root, "default_mod.json")):
-                    _write_json(os.path.join(pmp_root, "default_mod.json"),
-                                {"Files": {}, "Swaps": {}, "Manipulations": []})
+                _ensure_default_mod_has_content(
+                    os.path.join(pmp_root, "default_mod.json"))
 
                 # Zip and atomically overwrite the source .pmp in place
                 archive = shutil.make_archive(
@@ -783,7 +853,7 @@ class ProteusPackagerPlugin:
 
                 # default_mod.json
                 _write_json(os.path.join(pmp_root, "default_mod.json"),
-                            {"Files": {}, "Swaps": {}, "Manipulations": []})
+                            _default_mod_with_dummy())
 
                 # group_NNN_{name}.json
                 for idx, group in enumerate(groups_order, start=1):
@@ -1812,6 +1882,41 @@ def _upsert_option(options: list, entry: dict) -> bool:
 def _none_penumbra_option() -> dict:
     return {"Name": "None", "Description": "", "Image": "", "Files": {},
             "FileSwaps": {}, "Manipulations": []}
+
+
+# Penumbra treats a mod with no Files / Swaps / Manipulations across the
+# default option and every group as "empty" and flags it as invalid. Proteus
+# does the real work from its own metadata.json, so the Penumbra shell carries
+# a single no-op swap (a game path redirected to itself) in the always-applied
+# default option. It is never shown in the UI and changes nothing in-game, but
+# it makes the package count as a real mod.
+_DUMMY_SWAP_PATH = (
+    "chara/monster/m8030/obj/body/b0001/material/v0001/mt_m8030b0001_a.mtrl"
+)
+
+
+def _default_mod_with_dummy() -> dict:
+    return {"Files": {},
+            "Swaps": {_DUMMY_SWAP_PATH: _DUMMY_SWAP_PATH},
+            "Manipulations": []}
+
+
+def _ensure_default_mod_has_content(path: str) -> None:
+    """Guarantee default_mod.json registers as a real change so Penumbra does
+    not treat the pack as empty. Writes the no-op dummy swap when the file is
+    missing or has no Files/Swaps/Manipulations; leaves it untouched when it
+    already carries real content (so merges don't clobber real redirects)."""
+    data = None
+    if os.path.isfile(path):
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            data = None
+    if isinstance(data, dict) and (data.get("Files") or data.get("Swaps")
+                                   or data.get("Manipulations")):
+        return
+    _write_json(path, _default_mod_with_dummy())
 
 
 _FS_UNSAFE = re.compile(r'[<>:"/\\|?*]+')
