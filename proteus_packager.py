@@ -321,10 +321,20 @@ class ProteusPackagerPlugin:
         substance_painter.ui.add_dock_widget(self._widget)
         self._connect_ui_autosave()
         # Reflect the auto-detected colorset source on open, unless the user
-        # has a saved manual override (which is kept as-is).
-        if not self._colorset_meta_manual:
-            self._colorset_meta = self._resolve_colorset_meta()
-            self._colorset_meta_edit.setText(self._colorset_meta)
+        # has a saved manual override (which is kept as-is). Often a no-op here
+        # because the dock is built before any project is open — _on_project_opened
+        # repeats it once the project (and Penumbra match) is available.
+        self._refresh_colorset_meta_field()
+
+    def _refresh_colorset_meta_field(self):
+        """Show the auto-detected colorset source in the field so it matches what
+        export will actually reuse. Skips when the user set a manual override.
+        setText emits neither textEdited nor editingFinished, so this won't flip
+        the manual flag or trigger an autosave."""
+        if self._colorset_meta_manual:
+            return
+        self._colorset_meta = self._resolve_colorset_meta()
+        self._colorset_meta_edit.setText(self._colorset_meta)
 
     def _connect_ui_autosave(self):
         self._author_edit.editingFinished.connect(self._read_ui_settings)
@@ -445,6 +455,10 @@ class ProteusPackagerPlugin:
 
     def _on_project_opened(self, _ev=None):
         self._refresh_export_presets(select=self._export_preset)
+        # The dock is usually built before a project is open, so the colorset
+        # field starts blank; now that the project (and its matching Penumbra
+        # mod) is available, surface the auto-detected source it will reuse.
+        self._refresh_colorset_meta_field()
 
     # ── Update check ──────────────────────────────────────────────────────────
 
