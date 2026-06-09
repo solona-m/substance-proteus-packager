@@ -541,6 +541,10 @@ class ProteusPackagerPlugin:
         tiles: list = []
         try:
             for group in structure.keys():
+                # Masks are grayscale transparency images — they don't render as
+                # a meaningful 3D tile, so there is nothing to preview.
+                if _is_masks_group(group):
+                    continue
                 for option in structure[group]:
                     _set_visibility_for_option(ts_node_map, group, option)
                     _show_colorset_layers_for_option(ts_node_map, group, option)
@@ -711,13 +715,19 @@ class ProteusPackagerPlugin:
                         grp_files[gname] = [str(gp), gdata]
 
             for group in groups_order:
+                # A "Masks" group is a Penumbra-only multi-select group: it is
+                # never written into Proteus/metadata.json and has no "None".
+                is_masks = _is_masks_group(group)
+                gt = "Multi" if is_masks else group_type
                 if merge:
-                    og = pg_by_name.get(group)
-                    if og is None:
-                        og = {"PenumbraGroupName": group, "Options": []}
-                        proteus_meta["OptionGroups"].append(og)
-                        pg_by_name[group] = og
-                    og.setdefault("Options", [])
+                    og = None
+                    if not is_masks:
+                        og = pg_by_name.get(group)
+                        if og is None:
+                            og = {"PenumbraGroupName": group, "Options": []}
+                            proteus_meta["OptionGroups"].append(og)
+                            pg_by_name[group] = og
+                        og.setdefault("Options", [])
 
                     if group in grp_files:
                         gpath, gdata = grp_files[group]
@@ -727,20 +737,21 @@ class ProteusPackagerPlugin:
                         gpath = os.path.join(pmp_root, f"group_{max_idx:03d}_{safe}.json")
                         gdata = {"Version": 0, "Name": group, "Description": "",
                                  "Image": "", "Page": 0, "Priority": 0,
-                                 "Type": group_type, "DefaultSettings": 0,
+                                 "Type": gt, "DefaultSettings": 0,
                                  "Options": []}
                         grp_files[group] = [gpath, gdata]
                     gdata.setdefault("Options", [])
                     touched_group_files[gpath] = gdata
 
-                    proteus_opts = og["Options"]
+                    proteus_opts = og["Options"] if og is not None else None
                     penumbra_opts = gdata["Options"]
-                    taken = {o.get("Name") for o in proteus_opts}
-                    taken |= {o.get("Name") for o in penumbra_opts}
-                    if "None" not in taken:
-                        proteus_opts.append(_none_proteus_option())
-                        penumbra_opts.append(_none_penumbra_option())
-                        taken.add("None")
+                    if not is_masks:
+                        taken = {o.get("Name") for o in proteus_opts}
+                        taken |= {o.get("Name") for o in penumbra_opts}
+                        if "None" not in taken:
+                            proteus_opts.append(_none_proteus_option())
+                            penumbra_opts.append(_none_penumbra_option())
+                            taken.add("None")
                 else:
                     proteus_opts = []
                     penumbra_opts = None
@@ -761,6 +772,28 @@ class ProteusPackagerPlugin:
                         continue
 
                     final_name = option
+
+                    # Masks: one grayscale PNG at Proteus/Masks/<option>.png,
+                    # mapped to the Penumbra option by name. No Proteus metadata
+                    # entry, no overlay, no colorset.
+                    if is_masks:
+                        if not _copy_mask_option(exported_files, proteus_dir,
+                                                 final_name, self._suffixes["Mask"]):
+                            self._log(f"  No usable mask image — skipping {group}/{option}")
+                            continue
+                        self._log(f"  Mask: Masks/{final_name}.png")
+                        image_rel = _maybe_copy_preview_into_pack(
+                            self._resolve_output_dir(), mod_name,
+                            group, final_name, pmp_root)
+                        if image_rel:
+                            option_images[(group, final_name)] = image_rel
+                        if merge:
+                            _upsert_option(penumbra_opts, {
+                                "Name": final_name, "Description": "",
+                                "Image": image_rel,
+                                "Files": {}, "FileSwaps": {}, "Manipulations": []})
+                        # Fresh-mode masks group file is built from `structure` below.
+                        continue
 
                     # Copy recognised files into the Proteus sidecar tree.
                     # On merge, wipe any existing folder for this option so a
@@ -820,7 +853,7 @@ class ProteusPackagerPlugin:
                     else:
                         proteus_opts.append(pro_entry)
 
-                if not merge:
+                if not merge and not is_masks:
                     option_groups_meta.append({
                         "PenumbraGroupName": group,
                         "Options": [_none_proteus_option()] + proteus_opts,
@@ -871,15 +904,19 @@ class ProteusPackagerPlugin:
 
                 # group_NNN_{name}.json
                 for idx, group in enumerate(groups_order, start=1):
-                    opts = [_none_penumbra_option()] + [
+                    is_masks = _is_masks_group(group)
+                    gt = "Multi" if is_masks else group_type
+                    base_opts = [
                         {"Name": o, "Description": "",
                          "Image": option_images.get((group, o), ""),
                          "Files": {}, "FileSwaps": {}, "Manipulations": []}
                         for o in structure[group]]
+                    # Masks are always multi-select with no "None" option.
+                    opts = base_opts if is_masks else [_none_penumbra_option()] + base_opts
                     safe = re.sub(r"[^\w]", "_", group).lower()
                     _write_json(os.path.join(pmp_root, f"group_{idx:03d}_{safe}.json"), {
                         "Version": 0, "Name": group, "Description": "", "Image": "",
-                        "Page": 0, "Priority": 0, "Type": group_type,
+                        "Page": 0, "Priority": 0, "Type": gt,
                         "DefaultSettings": 0, "Options": opts,
                     })
 
@@ -1329,6 +1366,17 @@ def _node_children(node) -> list:
 
 _COLORSET_FOLDER_RE = re.compile(r"^\s*colorset\s*$", re.IGNORECASE)
 _COLORSET_ROW_RE    = re.compile(r"^\s*(\d{1,2})\s*([AB])\s*$", re.IGNORECASE)
+
+# Reserved top-level group name. A "Masks" group is special: its options are
+# grayscale transparency masks applied at runtime over the output of all other
+# groups. It is never written into Proteus/metadata.json — each option "Foo"
+# maps by name to a flat grayscale file at Proteus/Masks/Foo.png, and the group
+# is always a Penumbra multi-select group with no "None" option.
+_MASKS_GROUP_RE = re.compile(r"^\s*masks\s*$", re.IGNORECASE)
+
+
+def _is_masks_group(name: str) -> bool:
+    return bool(_MASKS_GROUP_RE.match(name or ""))
 
 
 def _parse_colorset_row_id(name: str):
@@ -1989,6 +2037,98 @@ def _maybe_copy_preview_into_pack(out_dir: str, mod_name: str,
 
 def _none_proteus_option() -> dict:
     return {"Name": "None", "Overlays": [], "ColorTableRows": []}
+
+
+def _pick_mask_image(exported_files: list, mask_suffixes: list) -> str:
+    """Choose the single grayscale image to use as a Masks option's output.
+    Prefer a file whose stem matches a configured Mask suffix (default _m) or
+    the bare 'mask' name; otherwise fall back to the lone / first file.
+    Returns '' if nothing was exported."""
+    if not exported_files:
+        return ""
+    for fpath in exported_files:
+        stem = Path(fpath).stem
+        if stem.lower() == "mask":
+            return fpath
+        for sfx in sorted(mask_suffixes, key=len, reverse=True):
+            if sfx and stem.endswith(sfx):
+                return fpath
+    return exported_files[0]
+
+
+def _write_grayscale_mask(src: str, dst: str) -> bool:
+    """Flatten an exported mask image to an 8-bit grayscale PNG suitable as a
+    transparency mask (white = opaque, black = transparent).
+
+    Substance commonly exports a mask authored in the Opacity channel as an RGBA
+    image with a flat base color and the real shape in the *alpha* channel — so
+    the visible RGB is a uniform grey. When the alpha channel carries the shape
+    we copy it into the grayscale; otherwise we fall back to the image's
+    luminance (for masks painted directly into a color channel). Returns False
+    (so the caller can fall back to a raw copy) on any failure."""
+    try:
+        def _fmt(name):
+            fmt_enum = getattr(QtGui.QImage, "Format", None)
+            if fmt_enum is not None and hasattr(fmt_enum, name):
+                return getattr(fmt_enum, name)
+            return getattr(QtGui.QImage, name)
+
+        img = QtGui.QImage(src)
+        if img.isNull():
+            return False
+        w, h = img.width(), img.height()
+        if w <= 0 or h <= 0:
+            return False
+
+        use_alpha = img.hasAlphaChannel()
+        alpha = None
+        if use_alpha:
+            rgba = img.convertToFormat(_fmt("Format_RGBA8888"))
+            bpl = rgba.bytesPerLine()
+            ptr = rgba.constBits()
+            if hasattr(ptr, "setsize"):          # PySide2 voidptr
+                ptr.setsize(rgba.sizeInBytes())
+            data = bytes(ptr)
+            alpha = bytearray(w * h)
+            for y in range(h):
+                base = y * bpl
+                alpha[y * w:(y + 1) * w] = data[base + 3: base + w * 4: 4]
+            # Uniformly opaque alpha carries no shape — use luminance instead.
+            if min(alpha) == 255:
+                use_alpha = False
+
+        if use_alpha:
+            gray = QtGui.QImage(bytes(alpha), w, h, w,
+                                _fmt("Format_Grayscale8")).copy()
+        else:
+            gray = img.convertToFormat(_fmt("Format_Grayscale8"))
+        return bool(gray.save(dst, "PNG"))
+    except Exception:
+        return False
+
+
+def _copy_mask_option(exported_files: list, proteus_dir: str, option: str,
+                      mask_suffixes: list) -> bool:
+    """Write a Masks option's grayscale transparency image to
+    Proteus/Masks/<option>.png (stamped, overwriting any existing file).
+    Returns True on success."""
+    src = _pick_mask_image(exported_files, mask_suffixes)
+    if not src:
+        return False
+    masks_dir = os.path.join(proteus_dir, "Masks")
+    os.makedirs(masks_dir, exist_ok=True)
+    dst = os.path.join(masks_dir, f"{option}.png")
+    tmp = dst + ".gray.png"
+    if _write_grayscale_mask(src, tmp):
+        _png_copy_stamped(tmp, dst, f"Masks/{option}")
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+    else:
+        # Conversion unavailable/failed — keep the raw export so nothing breaks.
+        _png_copy_stamped(src, dst, f"Masks/{option}")
+    return True
 
 
 def _load_colorset_map(path: str, log=None) -> dict:
