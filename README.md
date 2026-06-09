@@ -64,7 +64,9 @@ Multiple texture sets work fine — the plugin walks all texture sets and builds
 
 ### Masks (reserved group)
 
-A top-level folder named **`Masks`** (case-insensitive) is special. Its sub-folders are **mask options**, and each one produces a single **grayscale image** that the Proteus runtime applies as a **transparency mask over the composited output of all other groups** (black = transparent, white = opaque). It is not a material overlay — it doesn't add color, normals, or dye rows.
+A top-level folder named **`Masks`** (case-insensitive) is special. Its sub-folders are **mask options**, and each one produces a single image that the Proteus runtime applies as a **transparency mask over the composited output of all other groups**. It is not a material overlay — it doesn't add color, normals, or dye rows.
+
+The mask is an **RGBA PNG**: the **alpha channel** (authored in your layer **Opacity**) is the *apply region* — it tells Proteus which pixels the mask affects (opaque = apply, transparent = leave alone) — and the **RGB** carries the mask value applied there. Author the coverage in the **Opacity** channel and the value in **Base Color**; the plugin preserves that RGBA export verbatim.
 
 ```
 Body
@@ -78,9 +80,9 @@ Body
 The Masks group differs from normal groups:
 
 - It is **always multi-select** (Penumbra group `Type: Multi`), regardless of the **Mutually exclusive options** checkbox, and has **no "None" option** — leaving everything unselected is "off".
-- It is **not written into `Proteus/metadata.json`**. Each option maps **by name** to a flat grayscale file: option **`Foo`** → **`Proteus/Masks/Foo.png`**. The runtime resolves the selected option to its file by name.
-- Each option exports a single image; the plugin picks the one matching your **Mask** suffix (e.g. `_m`) or the bare `mask` name, otherwise the lone/first exported file.
-- It is skipped by **Generate previews** (a grayscale mask doesn't render as a meaningful 3D tile).
+- It is **not written into `Proteus/metadata.json`**. Each option maps **by name** to a flat file: option **`Foo`** → **`Proteus/Masks/Foo.png`**. The runtime resolves the selected option to its file by name.
+- Each option exports a single image; the plugin picks the exported PNG that **carries an alpha channel** (the Base-Color+Opacity map), otherwise the first exported file. If the picked image has no alpha, the log warns you — Proteus needs the alpha to know which pixels to apply.
+- It is skipped by **Generate previews** (a mask doesn't render as a meaningful 3D tile).
 
 > Because the option name becomes both the PNG filename and the runtime's lookup key, **keep mask option names filesystem-safe** — avoid `/ \ : * ? " < > |`.
 
@@ -181,12 +183,12 @@ MyMod.pmp  (renamed .zip)
     │   └── Fishnet/
     │       ├── diffuse.png
     │       └── normal.png
-    └── Masks/              ← flat grayscale files, NOT referenced by metadata.json
+    └── Masks/              ← flat RGBA mask files, NOT referenced by metadata.json
         ├── Stirrups.png    ← matches the "Stirrups" option in group_002_masks.json
         └── Socks.png
 ```
 
-The **Masks** group appears only as its Penumbra group file plus flat `Proteus/Masks/<Option>.png` files — there is no entry for it in `Proteus/metadata.json`. The runtime maps a selected mask option to its grayscale file purely by name.
+The **Masks** group appears only as its Penumbra group file plus flat `Proteus/Masks/<Option>.png` files — there is no entry for it in `Proteus/metadata.json`. The runtime maps a selected mask option to its file purely by name, reading the alpha channel as the apply region and the RGB as the mask value.
 
 Every exported PNG receives a small `tEXt` chunk stamped with its option's path (e.g. `Style/Roses`). Penumbra auto-deduplicates identical files, which would otherwise collapse pixel-identical index/mask textures across options into a single file and break per-option overlays. The stamp keeps the pixel data identical but the file bytes distinct, so Penumbra leaves each option's textures alone.
 

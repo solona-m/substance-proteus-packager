@@ -778,7 +778,7 @@ class ProteusPackagerPlugin:
                     # entry, no overlay, no colorset.
                     if is_masks:
                         if not _copy_mask_option(exported_files, proteus_dir,
-                                                 final_name, self._suffixes["Mask"]):
+                                                 final_name, self._log):
                             self._log(f"  No usable mask image — skipping {group}/{option}")
                             continue
                         self._log(f"  Mask: Masks/{final_name}.png")
@@ -2039,95 +2039,52 @@ def _none_proteus_option() -> dict:
     return {"Name": "None", "Overlays": [], "ColorTableRows": []}
 
 
-def _pick_mask_image(exported_files: list, mask_suffixes: list) -> str:
-    """Choose the single grayscale image to use as a Masks option's output.
-    Prefer a file whose stem matches a configured Mask suffix (default _m) or
-    the bare 'mask' name; otherwise fall back to the lone / first file.
+def _png_has_alpha(path: str) -> bool:
+    """True if the PNG declares an alpha channel (color type 4 = gray+alpha or
+    6 = truecolor+alpha), read straight from the IHDR header — no full decode."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(26)
+    except OSError:
+        return False
+    # 8-byte signature + 4-byte length + b"IHDR" + 4 width + 4 height +
+    # 1 bit-depth, then the color-type byte at offset 25.
+    if not head.startswith(_PNG_SIG) or len(head) < 26:
+        return False
+    return head[25] in (4, 6)
+
+
+def _pick_mask_image(exported_files: list) -> str:
+    """Choose the image to use as a Masks option's output. Prefer a PNG that
+    carries an alpha channel — that's the Base-Color+Opacity map whose alpha is
+    the 'apply region' Proteus reads. Fall back to the first exported file.
     Returns '' if nothing was exported."""
     if not exported_files:
         return ""
     for fpath in exported_files:
-        stem = Path(fpath).stem
-        if stem.lower() == "mask":
+        if _png_has_alpha(fpath):
             return fpath
-        for sfx in sorted(mask_suffixes, key=len, reverse=True):
-            if sfx and stem.endswith(sfx):
-                return fpath
     return exported_files[0]
 
 
-def _write_grayscale_mask(src: str, dst: str) -> bool:
-    """Flatten an exported mask image to an 8-bit grayscale PNG suitable as a
-    transparency mask (white = opaque, black = transparent).
-
-    Substance commonly exports a mask authored in the Opacity channel as an RGBA
-    image with a flat base color and the real shape in the *alpha* channel — so
-    the visible RGB is a uniform grey. When the alpha channel carries the shape
-    we copy it into the grayscale; otherwise we fall back to the image's
-    luminance (for masks painted directly into a color channel). Returns False
-    (so the caller can fall back to a raw copy) on any failure."""
-    try:
-        def _fmt(name):
-            fmt_enum = getattr(QtGui.QImage, "Format", None)
-            if fmt_enum is not None and hasattr(fmt_enum, name):
-                return getattr(fmt_enum, name)
-            return getattr(QtGui.QImage, name)
-
-        img = QtGui.QImage(src)
-        if img.isNull():
-            return False
-        w, h = img.width(), img.height()
-        if w <= 0 or h <= 0:
-            return False
-
-        use_alpha = img.hasAlphaChannel()
-        alpha = None
-        if use_alpha:
-            rgba = img.convertToFormat(_fmt("Format_RGBA8888"))
-            bpl = rgba.bytesPerLine()
-            ptr = rgba.constBits()
-            if hasattr(ptr, "setsize"):          # PySide2 voidptr
-                ptr.setsize(rgba.sizeInBytes())
-            data = bytes(ptr)
-            alpha = bytearray(w * h)
-            for y in range(h):
-                base = y * bpl
-                alpha[y * w:(y + 1) * w] = data[base + 3: base + w * 4: 4]
-            # Uniformly opaque alpha carries no shape — use luminance instead.
-            if min(alpha) == 255:
-                use_alpha = False
-
-        if use_alpha:
-            gray = QtGui.QImage(bytes(alpha), w, h, w,
-                                _fmt("Format_Grayscale8")).copy()
-        else:
-            gray = img.convertToFormat(_fmt("Format_Grayscale8"))
-        return bool(gray.save(dst, "PNG"))
-    except Exception:
-        return False
-
-
 def _copy_mask_option(exported_files: list, proteus_dir: str, option: str,
-                      mask_suffixes: list) -> bool:
-    """Write a Masks option's grayscale transparency image to
-    Proteus/Masks/<option>.png (stamped, overwriting any existing file).
-    Returns True on success."""
-    src = _pick_mask_image(exported_files, mask_suffixes)
+                      log=None) -> bool:
+    """Write a Masks option's image to Proteus/Masks/<option>.png (stamped,
+    overwriting any existing file). The exported RGBA is preserved verbatim:
+    RGB is the mask value and the alpha channel is the apply region (authored in
+    the Opacity channel) that tells Proteus which pixels to affect. Returns True
+    on success."""
+    src = _pick_mask_image(exported_files)
     if not src:
         return False
     masks_dir = os.path.join(proteus_dir, "Masks")
     os.makedirs(masks_dir, exist_ok=True)
     dst = os.path.join(masks_dir, f"{option}.png")
-    tmp = dst + ".gray.png"
-    if _write_grayscale_mask(src, tmp):
-        _png_copy_stamped(tmp, dst, f"Masks/{option}")
-        try:
-            os.remove(tmp)
-        except OSError:
-            pass
-    else:
-        # Conversion unavailable/failed — keep the raw export so nothing breaks.
-        _png_copy_stamped(src, dst, f"Masks/{option}")
+    _png_copy_stamped(src, dst, f"Masks/{option}")
+    if log and not _png_has_alpha(dst):
+        log(f"  Warning: mask '{option}' has no alpha channel — Proteus uses "
+            f"the alpha (the Opacity channel) as the apply region. Add an "
+            f"Opacity channel so the mask knows which pixels to affect.")
     return True
 
 
