@@ -60,6 +60,53 @@ _BIBO_PLUS_PATHS = "\n".join([
     "chara/human/c1601/obj/body/b0001/material/v0001/mt_c1601b0001_bibo.mtrl",
 ])
 
+_TALL_FEMALE_FACES_PATHS = "\n".join([
+    "chara/human/c0201/obj/face/f0001/material/mt_c0201f0001_fac_a.mtrl",
+    "chara/human/c0201/obj/face/f0002/material/mt_c0201f0002_fac_a.mtrl",
+    "chara/human/c0201/obj/face/f0003/material/mt_c0201f0003_fac_a.mtrl",
+    "chara/human/c0201/obj/face/f0004/material/mt_c0201f0004_fac_a.mtrl",
+    "chara/human/c0201/obj/face/f0005/material/mt_c0201f0005_fac_a.mtrl",
+    "chara/human/c0401/obj/face/f0101/material/mt_c0401f0101_fac_a.mtrl",
+    "chara/human/c0401/obj/face/f0102/material/mt_c0401f0102_fac_a.mtrl",
+    "chara/human/c0401/obj/face/f0103/material/mt_c0401f0103_fac_a.mtrl",
+    "chara/human/c0401/obj/face/f0104/material/mt_c0401f0104_fac_a.mtrl",
+    "chara/human/c0601/obj/face/f0001/material/mt_c0601f0001_fac_a.mtrl",
+    "chara/human/c0601/obj/face/f0002/material/mt_c0601f0002_fac_a.mtrl",
+    "chara/human/c0601/obj/face/f0003/material/mt_c0601f0003_fac_a.mtrl",
+    "chara/human/c0601/obj/face/f0004/material/mt_c0601f0004_fac_a.mtrl",
+    "chara/human/c0801/obj/face/f0001/material/mt_c0801f0001_fac_a.mtrl",
+    "chara/human/c0801/obj/face/f0002/material/mt_c0801f0002_fac_a.mtrl",
+    "chara/human/c0801/obj/face/f0003/material/mt_c0801f0003_fac_a.mtrl",
+    "chara/human/c0801/obj/face/f0004/material/mt_c0801f0004_fac_a.mtrl",
+    "chara/human/c0801/obj/face/f0101/material/mt_c0801f0101_fac_a.mtrl",
+    "chara/human/c0801/obj/face/f0102/material/mt_c0801f0102_fac_a.mtrl",
+    "chara/human/c0801/obj/face/f0103/material/mt_c0801f0103_fac_a.mtrl",
+    "chara/human/c0801/obj/face/f0104/material/mt_c0801f0104_fac_a.mtrl",
+    "chara/human/c1401/obj/face/f0001/material/mt_c1401f0001_fac_a.mtrl",
+    "chara/human/c1401/obj/face/f0002/material/mt_c1401f0002_fac_a.mtrl",
+    "chara/human/c1401/obj/face/f0003/material/mt_c1401f0003_fac_a.mtrl",
+    "chara/human/c1401/obj/face/f0004/material/mt_c1401f0004_fac_a.mtrl",
+    "chara/human/c1401/obj/face/f0101/material/mt_c1401f0101_fac_a.mtrl",
+    "chara/human/c1401/obj/face/f0102/material/mt_c1401f0102_fac_a.mtrl",
+    "chara/human/c1401/obj/face/f0103/material/mt_c1401f0103_fac_a.mtrl",
+    "chara/human/c1401/obj/face/f0104/material/mt_c1401f0104_fac_a.mtrl",
+    "chara/human/c1801/obj/face/f0001/material/mt_c1801f0001_fac_a.mtrl",
+    "chara/human/c1801/obj/face/f0002/material/mt_c1801f0002_fac_a.mtrl",
+    "chara/human/c1801/obj/face/f0003/material/mt_c1801f0003_fac_a.mtrl",
+    "chara/human/c1801/obj/face/f0004/material/mt_c1801f0004_fac_a.mtrl",
+    "chara/human/c1001/obj/face/f0001/material/mt_c1001f0001_fac_a.mtrl",
+    "chara/human/c1001/obj/face/f0002/material/mt_c1001f0002_fac_a.mtrl",
+    "chara/human/c1001/obj/face/f0003/material/mt_c1001f0003_fac_a.mtrl",
+    "chara/human/c1001/obj/face/f0004/material/mt_c1001f0004_fac_a.mtrl",
+    "chara/human/c1001/obj/face/f0101/material/mt_c1001f0101_fac_a.mtrl",
+    "chara/human/c1001/obj/face/f0102/material/mt_c1001f0102_fac_a.mtrl",
+    "chara/human/c1001/obj/face/f0103/material/mt_c1001f0103_fac_a.mtrl",
+    "chara/human/c1001/obj/face/f0104/material/mt_c1001f0104_fac_a.mtrl",
+    "chara/human/c1001/obj/face/f0201/material/mt_c1001f0201_fac_a.mtrl",
+    "chara/human/c1001/obj/face/f0202/material/mt_c1001f0202_fac_a.mtrl",
+    "chara/human/c1001/obj/face/f0249/material/mt_c1001f0249_fac_a.mtrl",
+])
+
 _plugin_instance = None
 
 
@@ -93,7 +140,7 @@ class ProteusPackagerPlugin:
             "Index":   ["_id"],
             "Mask":    ["_m"],
         }
-        self._presets: dict[str, str] = {"Bibo+": _BIBO_PLUS_PATHS}
+        self._presets: dict[str, str] = {"Bibo+": _BIBO_PLUS_PATHS, "Tall Female Faces": _TALL_FEMALE_FACES_PATHS}
 
         self._load_settings()
         self._create_ui()
@@ -129,10 +176,10 @@ class ProteusPackagerPlugin:
         m = cfg["MaterialPaths"] if "MaterialPaths" in cfg else {}
         self._material_paths = m.get("Default", _BIBO_PLUS_PATHS).replace("\\n", "\n")
 
-        self._presets = {"Bibo+": _BIBO_PLUS_PATHS}
+        self._presets = {"Bibo+": _BIBO_PLUS_PATHS, "Tall Female Faces": _TALL_FEMALE_FACES_PATHS}
         if "Presets" in cfg:
             for k, v in cfg["Presets"].items():
-                if k.lower() != "bibo+":
+                if k.lower() not in ("bibo+", "tall female faces"):
                     self._presets[k] = v.replace("\\n", "\n")
 
     def _save_settings(self):
@@ -150,7 +197,7 @@ class ProteusPackagerPlugin:
         cfg["Suffixes"] = {k: ",".join(v) for k, v in self._suffixes.items()}
         cfg["MaterialPaths"] = {"Default": self._material_paths.replace("\n", "\\n")}
         user_presets = {k: v.replace("\n", "\\n") for k, v in self._presets.items()
-                        if k != "Bibo+"}
+                        if k not in ("Bibo+", "Tall Female Faces")}
         if user_presets:
             cfg["Presets"] = user_presets
         with open(_INI_FILE, "w", encoding="utf-8") as f:
@@ -981,7 +1028,7 @@ class ProteusPackagerPlugin:
             "exportPath": output_dir,
             "exportList": [{"rootPath": ts} for ts in ts_names],
             "defaultExportPreset": preset_url or self._export_preset,
-            "exportParameters": [{"parameters": {"paddingAlgorithm": "infinite"}}],
+            "exportParameters": [{"parameters": {"paddingAlgorithm": "passthrough"}}],
         }
         try:
             result = substance_painter.export.export_project_textures(config)
