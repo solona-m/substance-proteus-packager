@@ -518,7 +518,8 @@ class ProteusPackagerPlugin:
         if not _HAS_LAYERSTACK:
             self._log("Layerstack API not available — cannot generate previews.")
             return
-        all_ts = list(substance_painter.textureset.all_texture_sets())
+        all_ts = _visible_texture_sets(
+            list(substance_painter.textureset.all_texture_sets()), log=self._log)
         structure, ts_node_map, _colorset_layers = _discover_structure(all_ts)
         if not structure:
             self._log("No group/option folder hierarchy found in the layer stack.")
@@ -609,7 +610,8 @@ class ProteusPackagerPlugin:
         author = self._author or "Unknown"
         mat_paths = [p.strip() for p in self._material_paths.splitlines() if p.strip()]
         group_type = "Single" if self._mutually_exclusive else "Multi"
-        all_ts = list(substance_painter.textureset.all_texture_sets())
+        all_ts = _visible_texture_sets(
+            list(substance_painter.textureset.all_texture_sets()), log=self._log)
         ts_names = [ts.name() for ts in all_ts]
 
         # 1. Discover structure from layer stack
@@ -762,10 +764,26 @@ class ProteusPackagerPlugin:
                     # Show only this option; hide everything else
                     _set_visibility_for_option(ts_node_map, group, option)
 
+                    # Only export texture sets that still have at least one
+                    # visible top-level node. Any TS that lacks the target
+                    # group folder has ALL its nodes hidden by the call above
+                    # and would export a flat blank that corrupts the overlay.
+                    ts_names_export = [
+                        ts_n for ts_n, ts_d in ts_node_map.items()
+                        if any(_node_visible(n) for n in ts_d.get("_top", []))
+                    ]
+                    if not ts_names_export:
+                        ts_names_export = ts_names
+                    elif len(ts_names_export) < len(ts_names):
+                        hidden = set(ts_names) - set(ts_names_export)
+                        self._log(f"  Skipping hidden texture set(s): "
+                                  f"{', '.join(sorted(hidden))}")
+
                     # Ask SP to export
                     opt_export_dir = os.path.join(export_root, group, option)
                     os.makedirs(opt_export_dir, exist_ok=True)
-                    exported_files = self._do_sp_export(ts_names, opt_export_dir, resolved_preset)
+                    exported_files = self._do_sp_export(
+                        ts_names_export, opt_export_dir, resolved_preset)
 
                     if not exported_files:
                         self._log(f"  No files produced — skipping {group}/{option}")
@@ -1156,6 +1174,35 @@ def _composite_preview_grid(tiles, out_path, canvas_w=1920, canvas_h=1080,
 
 
 # ── Layer stack helpers ───────────────────────────────────────────────────────
+
+def _visible_texture_sets(ts_list: list, log=None) -> list:
+    """Return only texture sets whose eye/enable toggle is ON in SP's Texture
+    Set List panel. Tries common API attribute names across SP versions. Falls
+    back to returning all sets when none of the attributes are recognised (so
+    the behaviour is unchanged on older SP builds).
+
+    Logs which sets are being skipped so the user knows filtering is active."""
+    result = []
+    for ts in ts_list:
+        visible = True  # include by default if API is unavailable
+        for attr in ("enabled", "is_enabled", "visible", "is_visible"):
+            v = getattr(ts, attr, None)
+            if v is None:
+                continue
+            try:
+                visible = bool(v() if callable(v) else v)
+            except Exception:
+                continue
+            break
+        if visible:
+            result.append(ts)
+        elif log:
+            log(f"Skipping hidden texture set: {ts.name()}")
+    # If no sets passed the filter (all hidden or API unavailable), export all.
+    if not result:
+        return ts_list
+    return result
+
 
 def _discover_structure(all_ts: list):
     """
