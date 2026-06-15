@@ -157,10 +157,6 @@ class ProteusPackagerPlugin:
         g = cfg["General"] if "General" in cfg else {}
         self._author = g.get("Author", "")
         self._output_dir = g.get("OutputDir", "")
-        self._existing_pmp = g.get("ExistingPmp", "")
-        self._colorset_meta = g.get("ColorsetMeta", "")
-        self._colorset_meta_manual = cfg.getboolean(
-            "General", "ColorsetMetaManual", fallback=False)
         self._export_preset = g.get("ExportPreset", "")
         self._mutually_exclusive = cfg.getboolean("General", "MutuallyExclusive", fallback=True)
         self._install_to_penumbra = cfg.getboolean("General", "InstallToPenumbra", fallback=False)
@@ -173,9 +169,6 @@ class ProteusPackagerPlugin:
             "Mask":    _split_csv(s.get("Mask",    "_m")),
         }
 
-        m = cfg["MaterialPaths"] if "MaterialPaths" in cfg else {}
-        self._material_paths = m.get("Default", _BIBO_PLUS_PATHS).replace("\\n", "\n")
-
         self._presets = {"Bibo+": _BIBO_PLUS_PATHS, "Tall Female Faces": _TALL_FEMALE_FACES_PATHS}
         if "Presets" in cfg:
             for k, v in cfg["Presets"].items():
@@ -187,21 +180,65 @@ class ProteusPackagerPlugin:
         cfg["General"] = {
             "Author": self._author,
             "OutputDir": self._output_dir,
-            "ExistingPmp": self._existing_pmp,
-            "ColorsetMeta": self._colorset_meta,
-            "ColorsetMetaManual": str(self._colorset_meta_manual),
             "ExportPreset": self._export_preset,
             "MutuallyExclusive": str(self._mutually_exclusive),
             "InstallToPenumbra": str(self._install_to_penumbra),
         }
         cfg["Suffixes"] = {k: ",".join(v) for k, v in self._suffixes.items()}
-        cfg["MaterialPaths"] = {"Default": self._material_paths.replace("\n", "\\n")}
         user_presets = {k: v.replace("\n", "\\n") for k, v in self._presets.items()
                         if k not in ("Bibo+", "Tall Female Faces")}
         if user_presets:
             cfg["Presets"] = user_presets
         with open(_INI_FILE, "w", encoding="utf-8") as f:
             cfg.write(f)
+
+    def _project_settings_path(self) -> str:
+        try:
+            fp = substance_painter.project.file_path()
+        except Exception:
+            return ""
+        if not fp:
+            return ""
+        return str(Path(fp).with_suffix(".proteus_packager.json"))
+
+    def _load_project_settings(self):
+        """Reset per-project fields to defaults, then load from sidecar if present."""
+        self._existing_pmp = ""
+        self._colorset_meta = ""
+        self._colorset_meta_manual = False
+        self._material_paths = _BIBO_PLUS_PATHS
+
+        path = self._project_settings_path()
+        if path and os.path.isfile(path):
+            try:
+                with open(path, encoding="utf-8") as f:
+                    d = json.load(f)
+                self._existing_pmp = d.get("ExistingPmp", "")
+                self._colorset_meta = d.get("ColorsetMeta", "")
+                self._colorset_meta_manual = d.get("ColorsetMetaManual", False)
+                self._material_paths = d.get("MaterialPaths", _BIBO_PLUS_PATHS)
+            except Exception:
+                pass
+
+        self._existing_pmp_edit.setText(self._existing_pmp)
+        self._material_edit.setPlainText(self._material_paths)
+        self._refresh_colorset_meta_field()
+
+    def _save_project_settings(self):
+        """Save per-project fields to a sidecar JSON next to the .spp file."""
+        path = self._project_settings_path()
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump({
+                    "ExistingPmp": self._existing_pmp,
+                    "ColorsetMeta": self._colorset_meta,
+                    "ColorsetMetaManual": self._colorset_meta_manual,
+                    "MaterialPaths": self._material_paths,
+                }, f, indent=2)
+        except Exception:
+            pass
 
     # ── UI ────────────────────────────────────────────────────────────────────
 
@@ -502,10 +539,7 @@ class ProteusPackagerPlugin:
 
     def _on_project_opened(self, _ev=None):
         self._refresh_export_presets(select=self._export_preset)
-        # The dock is usually built before a project is open, so the colorset
-        # field starts blank; now that the project (and its matching Penumbra
-        # mod) is available, surface the auto-detected source it will reuse.
-        self._refresh_colorset_meta_field()
+        self._load_project_settings()
 
     # ── Update check ──────────────────────────────────────────────────────────
 
@@ -638,6 +672,7 @@ class ProteusPackagerPlugin:
         for key, edit in self._suffix_edits.items():
             self._suffixes[key] = _split_csv(edit.text())
         self._save_settings()
+        self._save_project_settings()
 
     # ── Core packaging ────────────────────────────────────────────────────────
 
