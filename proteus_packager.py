@@ -24,6 +24,7 @@ import json
 import shutil
 import struct
 import tempfile
+import threading
 import zlib
 import configparser
 from pathlib import Path
@@ -58,6 +59,15 @@ _BIBO_PLUS_PATHS = "\n".join([
     "chara/human/c1401/obj/body/b0101/material/v0001/mt_c1401b0101_bibo.mtrl",
     "chara/human/c1801/obj/body/b0001/material/v0001/mt_c1801b0001_bibo.mtrl",
     "chara/human/c1601/obj/body/b0001/material/v0001/mt_c1601b0001_bibo.mtrl",
+])
+
+_GEN3_PATHS = "\n".join([
+    "chara/human/c0201/obj/body/b0001/material/v0001/mt_c0201b0001_b.mtrl",
+    "chara/human/c0401/obj/body/b0001/material/v0001/mt_c0401b0001_b.mtrl",
+    "chara/human/c1401/obj/body/b0001/material/v0001/mt_c1401b0001_b.mtrl",
+    "chara/human/c1401/obj/body/b0101/material/v0001/mt_c1401b0101_b.mtrl",
+    "chara/human/c1801/obj/body/b0001/material/v0001/mt_c1801b0001_b.mtrl",
+    "chara/human/c1601/obj/body/b0001/material/v0001/mt_c1601b0001_b.mtrl",
 ])
 
 _TALL_FEMALE_FACES_PATHS = "\n".join([
@@ -107,6 +117,10 @@ _TALL_FEMALE_FACES_PATHS = "\n".join([
     "chara/human/c1001/obj/face/f0249/material/mt_c1001f0249_fac_a.mtrl",
 ])
 
+_DIFFUSE_DILATION_PX       = 16  # SP diffusion distance for color textures
+_MASK_DILATION_PX          = 16  # max paint-search radius for mask dilation
+_MASK_DILATION_INNER_PX    =  5  # max seam-proximity radius for mask dilation
+
 _plugin_instance = None
 
 
@@ -140,10 +154,15 @@ class ProteusPackagerPlugin:
             "Index":   ["_id"],
             "Mask":    ["_m"],
         }
-        self._presets: dict[str, str] = {"Bibo+": _BIBO_PLUS_PATHS, "Tall Female Faces": _TALL_FEMALE_FACES_PATHS}
+        self._presets: dict[str, str] = {"Bibo+": _BIBO_PLUS_PATHS, "Gen3": _GEN3_PATHS, "Tall Female Faces": _TALL_FEMALE_FACES_PATHS}
+        self._gen3_mask_bg = ""
 
         self._load_settings()
         self._create_ui()
+        # Restore material preset combo to saved selection (UI exists now).
+        idx = self._mat_preset_combo.findText(self._mat_preset_name)
+        if idx >= 0:
+            self._mat_preset_combo.setCurrentIndex(idx)
         self._connect_events()
         # Defer the network check so the dock paints first.
         QtCore.QTimer.singleShot(0, self._check_for_plugin_update)
@@ -160,6 +179,10 @@ class ProteusPackagerPlugin:
         self._export_preset = g.get("ExportPreset", "")
         self._mutually_exclusive = cfg.getboolean("General", "MutuallyExclusive", fallback=True)
         self._install_to_penumbra = cfg.getboolean("General", "InstallToPenumbra", fallback=False)
+        _default_gen3_bg = os.path.join(os.path.dirname(__file__), "gen3_mask_background.png")
+        self._gen3_mask_bg = g.get("Gen3MaskBackground", _default_gen3_bg)
+        self._mat_preset_name = g.get("MaterialPreset", "Bibo+")
+        self._material_paths = g.get("MaterialPaths", "").replace("\\n", "\n") or _BIBO_PLUS_PATHS
 
         s = cfg["Suffixes"] if "Suffixes" in cfg else {}
         self._suffixes = {
@@ -169,10 +192,10 @@ class ProteusPackagerPlugin:
             "Mask":    _split_csv(s.get("Mask",    "_m")),
         }
 
-        self._presets = {"Bibo+": _BIBO_PLUS_PATHS, "Tall Female Faces": _TALL_FEMALE_FACES_PATHS}
+        self._presets = {"Bibo+": _BIBO_PLUS_PATHS, "Gen3": _GEN3_PATHS, "Tall Female Faces": _TALL_FEMALE_FACES_PATHS}
         if "Presets" in cfg:
             for k, v in cfg["Presets"].items():
-                if k.lower() not in ("bibo+", "tall female faces"):
+                if k.lower() not in ("bibo+", "gen3", "tall female faces"):
                     self._presets[k] = v.replace("\\n", "\n")
 
     def _save_settings(self):
@@ -183,10 +206,13 @@ class ProteusPackagerPlugin:
             "ExportPreset": self._export_preset,
             "MutuallyExclusive": str(self._mutually_exclusive),
             "InstallToPenumbra": str(self._install_to_penumbra),
+            "Gen3MaskBackground": self._gen3_mask_bg,
+            "MaterialPreset": self._mat_preset_name,
+            "MaterialPaths": self._material_paths.replace("\n", "\\n"),
         }
         cfg["Suffixes"] = {k: ",".join(v) for k, v in self._suffixes.items()}
         user_presets = {k: v.replace("\n", "\\n") for k, v in self._presets.items()
-                        if k not in ("Bibo+", "Tall Female Faces")}
+                        if k not in ("Bibo+", "Gen3", "Tall Female Faces")}
         if user_presets:
             cfg["Presets"] = user_presets
         with open(_INI_FILE, "w", encoding="utf-8") as f:
@@ -206,7 +232,7 @@ class ProteusPackagerPlugin:
         self._existing_pmp = ""
         self._colorset_meta = ""
         self._colorset_meta_manual = False
-        self._material_paths = _BIBO_PLUS_PATHS
+        # Keep INI-loaded material paths as default; project sidecar may override.
 
         path = self._project_settings_path()
         if path and os.path.isfile(path):
@@ -216,7 +242,7 @@ class ProteusPackagerPlugin:
                 self._existing_pmp = d.get("ExistingPmp", "")
                 self._colorset_meta = d.get("ColorsetMeta", "")
                 self._colorset_meta_manual = d.get("ColorsetMetaManual", False)
-                self._material_paths = d.get("MaterialPaths", _BIBO_PLUS_PATHS)
+                self._material_paths = d.get("MaterialPaths", self._material_paths)
             except Exception:
                 pass
 
@@ -667,6 +693,7 @@ class ProteusPackagerPlugin:
         self._export_preset = (self._export_preset_combo.currentData()
                                or self._export_preset_combo.currentText().strip())
         self._material_paths = self._material_edit.toPlainText().strip()
+        self._mat_preset_name = self._mat_preset_combo.currentText()
         self._mutually_exclusive = self._mutex_check.isChecked()
         self._install_to_penumbra = self._install_penumbra_check.isChecked()
         for key, edit in self._suffix_edits.items():
@@ -752,6 +779,16 @@ class ProteusPackagerPlugin:
             groups_order = list(structure.keys())
             option_groups_meta = []          # fresh-mode Proteus OptionGroups
             option_images: dict = {}         # (group, option) -> rel image path
+            mask_threads: list = []
+
+            # Decode the Gen3 mask background once; reused for every mask option.
+            mask_bg: tuple | None = None
+            if "_b.mtrl" in self._material_paths and self._gen3_mask_bg:
+                _bg = _png_decode_rgba(self._gen3_mask_bg, self._log)
+                if _bg[0] is not None:
+                    mask_bg = _bg
+                else:
+                    self._log(f"  Warning: could not load Gen3 mask background: {self._gen3_mask_bg}")
 
             colorset_map: dict = {}
             # Manual override wins; otherwise re-detect fresh for this project
@@ -865,7 +902,8 @@ class ProteusPackagerPlugin:
                     opt_export_dir = os.path.join(export_root, group, option)
                     os.makedirs(opt_export_dir, exist_ok=True)
                     exported_files = self._do_sp_export(
-                        ts_names_export, opt_export_dir, resolved_preset)
+                        ts_names_export, opt_export_dir, resolved_preset,
+                        passthrough=is_masks)
 
                     if not exported_files:
                         self._log(f"  No files produced — skipping {group}/{option}")
@@ -878,7 +916,8 @@ class ProteusPackagerPlugin:
                     # entry, no overlay, no colorset.
                     if is_masks:
                         if not _copy_mask_option(exported_files, proteus_dir,
-                                                 final_name, self._log):
+                                                 final_name, self._log,
+                                                 mask_bg, mask_threads):
                             self._log(f"  No usable mask image — skipping {group}/{option}")
                             continue
                         self._log(f"  Mask: Masks/{final_name}.png")
@@ -958,6 +997,11 @@ class ProteusPackagerPlugin:
                         "PenumbraGroupName": group,
                         "Options": [_none_proteus_option()] + proteus_opts,
                     })
+
+            if mask_threads:
+                self._log(f"Finishing {len(mask_threads)} mask background composite(s)…")
+                for _t in mask_threads:
+                    _t.join()
 
             if merge:
                 # Update the Proteus sidecar + only the touched group files;
@@ -1057,13 +1101,18 @@ class ProteusPackagerPlugin:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
     def _do_sp_export(self, ts_names: list[str], output_dir: str,
-                      preset_url: str = "") -> list[str]:
+                      preset_url: str = "", passthrough: bool = False) -> list[str]:
+        if passthrough:
+            params = {"paddingAlgorithm": "passthrough"}
+        else:
+            params = {"paddingAlgorithm": "diffusion",
+                      "dilationDistance": _DIFFUSE_DILATION_PX}
         config = {
             "exportShaderParams": False,
             "exportPath": output_dir,
             "exportList": [{"rootPath": ts} for ts in ts_names],
             "defaultExportPreset": preset_url or self._export_preset,
-            "exportParameters": [{"parameters": {"paddingAlgorithm": "passthrough"}}],
+            "exportParameters": [{"parameters": params}],
         }
         try:
             result = substance_painter.export.export_project_textures(config)
@@ -2196,24 +2245,317 @@ def _pick_mask_image(exported_files: list) -> str:
     return exported_files[0]
 
 
+def _png_decode_rgba(path: str, log=None) -> tuple:
+    """Decode a PNG to a flat RGBA bytearray. Returns (pixels, w, h).
+    pixels is None on failure. Handles Gray, RGB, Gray+Alpha, RGBA."""
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except OSError as exc:
+        if log:
+            log(f"  Warning: cannot read {path}: {exc}")
+        return None, 0, 0
+    if not data.startswith(_PNG_SIG):
+        return None, 0, 0
+    chunks, i = [], 8
+    while i + 12 <= len(data):
+        n = struct.unpack(">I", data[i:i+4])[0]
+        t, d = data[i+4:i+8], data[i+8:i+8+n]
+        chunks.append((t, d))
+        i += 12 + n
+        if t == b"IEND":
+            break
+    ihdr = next((d for t, d in chunks if t == b"IHDR"), None)
+    if not ihdr:
+        return None, 0, 0
+    w, h = struct.unpack(">II", ihdr[:8])
+    bd, ct = ihdr[8], ihdr[9]
+    if bd != 8:
+        if log:
+            log(f"  Warning: {path} is not 8-bit — bg skipped")
+        return None, w, h
+    ch = {0: 1, 2: 3, 4: 2, 6: 4}.get(ct)
+    if ch is None:
+        return None, w, h
+    raw = zlib.decompress(b"".join(d for t, d in chunks if t == b"IDAT"))
+    stride = w * ch
+    src_px = bytearray(h * stride)
+    prev = bytearray(stride)
+    for y in range(h):
+        base = y * (stride + 1)
+        ft = raw[base]
+        row = bytearray(raw[base+1:base+1+stride])
+        if ft == 1:
+            for x in range(ch, stride): row[x] = (row[x] + row[x-ch]) & 255
+        elif ft == 2:
+            for x in range(stride): row[x] = (row[x] + prev[x]) & 255
+        elif ft == 3:
+            for x in range(stride):
+                a = row[x-ch] if x >= ch else 0
+                row[x] = (row[x] + (a + prev[x]) // 2) & 255
+        elif ft == 4:
+            for x in range(stride):
+                a = row[x-ch] if x >= ch else 0
+                b2, c2 = prev[x], (prev[x-ch] if x >= ch else 0)
+                pa, pb, pc = abs(b2-c2), abs(a-c2), abs(a+b2-2*c2)
+                row[x] = (row[x] + (a if pa<=pb and pa<=pc else b2 if pb<=pc else c2)) & 255
+        src_px[y*stride:(y+1)*stride] = row
+        prev = row
+    rgba = bytearray(w * h * 4)
+    if ct == 6:
+        rgba[:] = src_px
+    elif ct == 2:
+        for i in range(w * h):
+            rgba[i*4:i*4+3] = src_px[i*3:i*3+3]
+            rgba[i*4+3] = 255
+    elif ct == 4:
+        for i in range(w * h):
+            g = src_px[i*2]
+            rgba[i*4] = rgba[i*4+1] = rgba[i*4+2] = g
+            rgba[i*4+3] = src_px[i*2+1]
+    else:  # ct == 0, Gray
+        for i in range(w * h):
+            g = src_px[i]
+            rgba[i*4] = rgba[i*4+1] = rgba[i*4+2] = g
+            rgba[i*4+3] = 255
+    return rgba, w, h
+
+
+
+def _dilate_mask(src: str, dst: str, log=None, bg: tuple | None = None) -> bool:
+    """Grow the painted (alpha>0) region of a mask outward, but only across UV
+    seams. A transparent pixel is filled from its nearest painted pixel only
+    when it lies within _MASK_DILATION_INNER_PX of a UV-island border AND within
+    _MASK_DILATION_PX of actual paint. This kills the seam line without bleeding
+    into intentionally-neutral areas. bg is (pixels, w, h) from _png_decode_rgba;
+    a UV-island border is wherever bg alpha-membership flips between neighbours
+    (the bg's alpha polarity does not matter). Original opaque pixels are kept."""
+    R = _MASK_DILATION_PX
+    px, w, h = _png_decode_rgba(src, log)
+    if px is None:
+        if log:
+            log(f"  Warning: could not decode mask for dilation — copying raw")
+        return False
+
+    stride = w * 4
+    orig = bytes(px)
+
+    # Resolve bg alpha lookup; scale nearest-neighbour if bg size != mask size.
+    bg_alpha_fn = None  # callable(y, x) → bg alpha byte at mask coords (x, y)
+    if bg is not None:
+        bg_pix, bw, bh = bg
+        if bw == w and bh == h:
+            _bg_stride = bw * 4
+            def bg_alpha_fn(y, x, _p=bg_pix, _s=_bg_stride):
+                return _p[y * _s + x * 4 + 3]
+        else:
+            _bg_stride = bw * 4
+            _sx_scale = bw / w
+            _sy_scale = bh / h
+            def bg_alpha_fn(y, x, _p=bg_pix, _s=_bg_stride,
+                            _sx=_sx_scale, _sy=_sy_scale):
+                return _p[int(y * _sy) * _s + int(x * _sx) * 4 + 3]
+            if log:
+                log(f"  Info: bg {bw}x{bh} scaled to mask {w}x{h} for UV edge_dist")
+
+    # Per-pixel nearest-source tracking.
+    INF = R + 1
+    best_d = bytearray([INF] * (w * h))
+    best_sx = [-1] * (w * h)
+    best_sy = [-1] * (w * h)
+
+    # Seed: original opaque pixels, distance 0.
+    for y in range(h):
+        ro = y * stride
+        ri = y * w
+        for x in range(w):
+            if orig[ro + x * 4 + 3] > 0:
+                best_d[ri + x] = 0
+                best_sx[ri + x] = x
+                best_sy[ri + x] = y
+
+    # 4-sweep distance propagation.
+    for y in range(h):          # L→R
+        ri = y * w
+        for x in range(1, w):
+            pi = ri + x - 1
+            d = best_d[pi] + 1
+            if d < best_d[ri + x] and d <= R:
+                best_d[ri + x] = d
+                best_sx[ri + x] = best_sx[pi]
+                best_sy[ri + x] = best_sy[pi]
+
+    for y in range(h):          # R→L
+        ri = y * w
+        for x in range(w - 2, -1, -1):
+            ni = ri + x + 1
+            d = best_d[ni] + 1
+            if d < best_d[ri + x] and d <= R:
+                best_d[ri + x] = d
+                best_sx[ri + x] = best_sx[ni]
+                best_sy[ri + x] = best_sy[ni]
+
+    for y in range(1, h):       # T→B
+        ri = y * w
+        pi = ri - w
+        for x in range(w):
+            d = best_d[pi + x] + 1
+            if d < best_d[ri + x] and d <= R:
+                best_d[ri + x] = d
+                best_sx[ri + x] = best_sx[pi + x]
+                best_sy[ri + x] = best_sy[pi + x]
+
+    for y in range(h - 2, -1, -1):  # B→T
+        ri = y * w
+        ni = ri + w
+        for x in range(w):
+            d = best_d[ni + x] + 1
+            if d < best_d[ri + x] and d <= R:
+                best_d[ri + x] = d
+                best_sx[ri + x] = best_sx[ni + x]
+                best_sy[ri + x] = best_sy[ni + x]
+
+    # Precompute distance-to-UV-island-border for each pixel: how many pixels
+    # it is from the nearest UV seam (where bg "inside island" membership flips
+    # between neighbours). Only pixels within R_INNER of a border are eligible
+    # for dilation, so large neutral areas — whether deep inside an island or
+    # far out in inter-island space — are left untouched. (The bg's alpha
+    # polarity is irrelevant here: we key off the boundary, not the fill value.)
+    R_INNER = _MASK_DILATION_INNER_PX
+    edge_dist = None
+    if bg_alpha_fn is not None:
+        INF_E = R_INNER + 1
+        # Membership map: 1 = inside a UV island per the bg.
+        inside = bytearray(w * h)
+        for y in range(h):
+            ri = y * w
+            for x in range(w):
+                inside[ri + x] = 1 if bg_alpha_fn(y, x) > 0 else 0
+        # Seed dist 0 at border pixels: membership differs from right/below.
+        edge_dist = bytearray([INF_E] * (w * h))
+        for y in range(h):
+            ri = y * w
+            for x in range(w):
+                c = inside[ri + x]
+                if x + 1 < w and inside[ri + x + 1] != c:
+                    edge_dist[ri + x] = 0
+                    edge_dist[ri + x + 1] = 0
+                if y + 1 < h and inside[ri + w + x] != c:
+                    edge_dist[ri + x] = 0
+                    edge_dist[ri + w + x] = 0
+        for y in range(h):            # L→R
+            ri = y * w
+            for x in range(1, w):
+                d = edge_dist[ri + x - 1] + 1
+                if d < edge_dist[ri + x]:
+                    edge_dist[ri + x] = min(d, INF_E)
+        for y in range(h):            # R→L
+            ri = y * w
+            for x in range(w - 2, -1, -1):
+                d = edge_dist[ri + x + 1] + 1
+                if d < edge_dist[ri + x]:
+                    edge_dist[ri + x] = min(d, INF_E)
+        for y in range(1, h):         # T→B
+            ri = y * w
+            pi = ri - w
+            for x in range(w):
+                d = edge_dist[pi + x] + 1
+                if d < edge_dist[ri + x]:
+                    edge_dist[ri + x] = min(d, INF_E)
+        for y in range(h - 2, -1, -1):  # B→T
+            ri = y * w
+            ni = ri + w
+            for x in range(w):
+                d = edge_dist[ni + x] + 1
+                if d < edge_dist[ri + x]:
+                    edge_dist[ri + x] = min(d, INF_E)
+
+    # Apply: fill an originally-transparent pixel only when it is near BOTH a
+    # UV seam (edge_dist <= R_INNER) and actual paint (best_d <= R). This pins
+    # dilation to the seam, leaving intentionally-neutral interior/exterior
+    # areas — and paint boundaries that aren't on a UV edge — untouched.
+    for y in range(h):
+        ri = y * w
+        ro = y * stride
+        for x in range(w):
+            off = ro + x * 4
+            if orig[off + 3] != 0:
+                continue
+            d = best_d[ri + x]
+            if d > R:
+                continue
+            if edge_dist is not None and edge_dist[ri + x] > R_INNER:
+                continue  # too far from a UV seam
+            sx = best_sx[ri + x]
+            sy = best_sy[ri + x]
+            s = sy * stride + sx * 4
+            px[off:off + 4] = orig[s:s + 4]
+
+    # Encode as RGBA PNG (filter type 0).
+    out_raw = bytearray()
+    for row_y in range(h):
+        out_raw.append(0)
+        out_raw += px[row_y * stride:(row_y + 1) * stride]
+    compressed = zlib.compress(bytes(out_raw), 6)
+    ihdr_data = struct.pack(">II", w, h) + bytes([8, 6, 0, 0, 0])
+
+    def _chunk(ct, cd):
+        return (struct.pack(">I", len(cd)) + ct + cd
+                + struct.pack(">I", zlib.crc32(ct + cd) & 0xFFFFFFFF))
+
+    out = bytearray(_PNG_SIG)
+    out += _chunk(b"IHDR", ihdr_data)
+    out += _chunk(b"IDAT", compressed)
+    out += _PNG_IEND
+    try:
+        with open(dst, "wb") as f:
+            f.write(out)
+        return True
+    except Exception as exc:
+        if log:
+            log(f"  ERROR: cannot write dilated mask: {exc}")
+        return False
+
+
 def _copy_mask_option(exported_files: list, proteus_dir: str, option: str,
-                      log=None) -> bool:
-    """Write a Masks option's image to Proteus/Masks/<option>.png (stamped,
-    overwriting any existing file). The exported RGBA is preserved verbatim:
-    RGB is the mask value and the alpha channel is the apply region (authored in
-    the Opacity channel) that tells Proteus which pixels to affect. Returns True
-    on success."""
+                      log=None, mask_bg: tuple | None = None,
+                      _threads: list | None = None) -> bool:
+    """Write a Masks option's image to Proteus/Masks/<option>.png (stamped).
+    If mask_bg is provided (decoded RGBA of the UV-boundary map PNG), dilation
+    is applied so seam-gap pixels carry the nearest painted value rather than
+    staying neutral (alpha=0). Processing runs on a background thread when
+    _threads is given."""
     src = _pick_mask_image(exported_files)
     if not src:
         return False
     masks_dir = os.path.join(proteus_dir, "Masks")
     os.makedirs(masks_dir, exist_ok=True)
     dst = os.path.join(masks_dir, f"{option}.png")
-    _png_copy_stamped(src, dst, f"Masks/{option}")
-    if log and not _png_has_alpha(dst):
-        log(f"  Warning: mask '{option}' has no alpha channel — Proteus uses "
-            f"the alpha (the Opacity channel) as the apply region. Add an "
-            f"Opacity channel so the mask knows which pixels to affect.")
+    label = f"Masks/{option}"
+
+    def _work():
+        try:
+            if mask_bg:
+                if not _dilate_mask(src, dst, log, bg=mask_bg):
+                    shutil.copy2(src, dst)
+                _png_copy_stamped(dst, dst, label)
+            else:
+                _png_copy_stamped(src, dst, label)
+        except Exception as exc:
+            if log:
+                log(f"  ERROR: mask '{option}' processing failed — {exc}")
+            _png_copy_stamped(src, dst, label)
+        if log and not _png_has_alpha(dst):
+            log(f"  Warning: mask '{option}' has no alpha channel — Proteus uses "
+                f"the alpha (the Opacity channel) as the apply region. Add an "
+                f"Opacity channel so the mask knows which pixels to affect.")
+
+    if _threads is not None:
+        t = threading.Thread(target=_work, daemon=True, name=f"mask-bg-{option}")
+        t.start()
+        _threads.append(t)
+    else:
+        _work()
     return True
 
 
