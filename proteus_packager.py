@@ -930,16 +930,17 @@ class ProteusPackagerPlugin:
 
                     final_name = option
 
-                    # Masks: one grayscale PNG at Proteus/Masks/<option>.png,
-                    # mapped to the Penumbra option by name. No Proteus metadata
-                    # entry, no overlay, no colorset.
+                    # Masks: Diffuse/Mask (+ Normal/Index if the preset
+                    # produced them) at Proteus/Masks/<option>[_n|_id].png,
+                    # mapped to the Penumbra option by name. No Proteus
+                    # metadata entry, no overlay, no colorset.
                     if is_masks:
                         if not _copy_mask_option(exported_files, proteus_dir,
                                                  final_name, self._log,
-                                                 mask_bg, mask_threads):
+                                                 mask_bg, mask_threads,
+                                                 detect_type=self._detect_type):
                             self._log(f"  No usable mask image — skipping {group}/{option}")
                             continue
-                        self._log(f"  Mask: Masks/{final_name}.png")
                         image_rel = _maybe_copy_preview_into_pack(
                             self._resolve_output_dir(), mod_name,
                             group, final_name, pmp_root)
@@ -2056,14 +2057,22 @@ def _write_file_resilient(src_f: str, dst_f: str, log=None) -> bool:
 
 def _sync_tree_resilient(src_root: str, dst_root: str, log=None) -> int:
     """Copy src_root's contents into dst_root in place (overwriting existing
-    files, removing stale ones), instead of shutil.rmtree()-ing dst_root and
-    recreating it. A delete-then-recreate aborts the *entire* install the
-    moment a single file is locked — e.g. the game currently has this mod's
-    textures open in Penumbra. Copying in place lets every unlocked file get
-    updated normally; a still-locked file is skipped (logged) and simply
-    picked up on the next export once whatever has it open releases it.
-    Returns the number of files that could not be written/removed."""
+    files), instead of shutil.rmtree()-ing dst_root and recreating it. A
+    delete-then-recreate aborts the *entire* install the moment a single file
+    is locked — e.g. the game currently has this mod's textures open in
+    Penumbra. Copying in place lets every unlocked file get updated normally;
+    a still-locked file is skipped (logged) and simply picked up on the next
+    export once whatever has it open releases it.
+
+    Deliberately does NOT delete files present in dst_root but absent from
+    src_root: if this export run is ever incomplete for an unrelated reason
+    (an SP export hiccup, a thread that didn't produce output, etc.), a
+    stale-cleanup pass would read that as "this option was removed" and
+    delete perfectly good files from the live install. Leftover files are
+    logged instead so they can be removed by hand if an option really was
+    deleted. Returns the number of files that could not be written."""
     skipped = 0
+    seen: set[str] = set()
     for dirpath, _dirnames, filenames in os.walk(src_root):
         rel = os.path.relpath(dirpath, src_root)
         dst_dir = dst_root if rel == "." else os.path.join(dst_root, rel)
@@ -2071,27 +2080,21 @@ def _sync_tree_resilient(src_root: str, dst_root: str, log=None) -> int:
         for fname in filenames:
             src_f = os.path.join(dirpath, fname)
             dst_f = os.path.join(dst_dir, fname)
+            seen.add(os.path.normcase(dst_f))
             if not _write_file_resilient(src_f, dst_f, log=log):
                 skipped += 1
 
-    # Remove stale files/dirs that no longer exist in the fresh export.
-    for dirpath, _dirnames, filenames in os.walk(dst_root, topdown=False):
-        rel = os.path.relpath(dirpath, dst_root)
-        src_dir = src_root if rel == "." else os.path.join(src_root, rel)
+    leftover = []
+    for dirpath, _dirnames, filenames in os.walk(dst_root):
         for fname in filenames:
-            if not os.path.isfile(os.path.join(src_dir, fname)):
-                try:
-                    os.remove(os.path.join(dirpath, fname))
-                except OSError as exc:
-                    skipped += 1
-                    if log:
-                        log(f"  Warning: could not remove stale file "
-                            f"{os.path.relpath(os.path.join(dirpath, fname), dst_root)}: {exc}")
-        if dirpath != dst_root and not os.path.isdir(src_dir):
-            try:
-                os.rmdir(dirpath)
-            except OSError:
-                pass
+            dst_f = os.path.join(dirpath, fname)
+            if os.path.normcase(dst_f) not in seen:
+                leftover.append(os.path.relpath(dst_f, dst_root))
+    if leftover and log:
+        log(f"  Note: {len(leftover)} file(s) in the installed mod weren't "
+            f"part of this export and were left as-is (remove by hand if "
+            f"that option was intentionally deleted): "
+            + ", ".join(leftover[:10]) + (", …" if len(leftover) > 10 else ""))
     return skipped
 
 
@@ -2856,36 +2859,67 @@ def _dilate_mask(src: str, dst: str, log=None, bg: tuple | None = None) -> bool:
 
 def _copy_mask_option(exported_files: list, proteus_dir: str, option: str,
                       log=None, mask_bg: tuple | None = None,
-                      _threads: list | None = None) -> bool:
-    """Write a Masks option's image to Proteus/Masks/<option>.png (stamped).
-    If mask_bg is provided (decoded RGBA of the UV-boundary map PNG), dilation
-    is applied so seam-gap pixels carry the nearest painted value rather than
-    staying neutral (alpha=0). Processing runs on a background thread when
-    _threads is given."""
-    src = _pick_mask_image(exported_files)
-    if not src:
+                      _threads: list | None = None,
+                      detect_type=None) -> bool:
+    """Write a Masks option's exported channels into Proteus/Masks/ (stamped):
+    the alpha-bearing Diffuse/Mask channel as <option>.png — Proteus reads its
+    alpha as the apply region — plus Normal as <option>_n.png and Index as
+    <option>_id.png when the export preset produced them, same as a regular
+    (non-Masks) option gets. detect_type classifies each exported file using
+    the same suffix mapping configured in Settings (pass the plugin's
+    _detect_type). If mask_bg is provided (decoded RGBA of the UV-boundary map
+    PNG), the same seam-gap dilation applied to the Diffuse/Mask channel is
+    also applied to Normal/Index — they share the same UV layout and gaps.
+    Processing runs on a background thread when _threads is given."""
+    if not exported_files:
         return False
+
+    buckets: dict[str, list[str]] = {}
+    for fpath in exported_files:
+        tex_type = detect_type(fpath) if detect_type else None
+        if tex_type is None:
+            continue
+        buckets.setdefault(tex_type, []).append(fpath)
+
+    # The primary alpha/opacity-bearing image: prefer whichever candidate
+    # (a Diffuse or an explicit Mask channel) actually carries alpha.
+    primary_candidates = buckets.get("Diffuse", []) + buckets.get("Mask", [])
+    primary = _pick_mask_image(primary_candidates) or _pick_mask_image(exported_files)
+    if not primary:
+        return False
+
     masks_dir = os.path.join(proteus_dir, "Masks")
     os.makedirs(masks_dir, exist_ok=True)
-    dst = os.path.join(masks_dir, f"{option}.png")
-    label = f"Masks/{option}"
+
+    outputs = [(primary, f"{option}.png", True, "Mask")]
+    for fpath in buckets.get("Normal", [])[:1]:
+        outputs.append((fpath, f"{option}_n.png", False, "Normal"))
+    for fpath in buckets.get("Index", [])[:1]:
+        outputs.append((fpath, f"{option}_id.png", False, "Index"))
+
+    if log:
+        for _src, fname, _is_primary, kind in outputs:
+            log(f"  {kind}: Masks/{fname}")
 
     def _work():
-        try:
-            if mask_bg:
-                if not _dilate_mask(src, dst, log, bg=mask_bg):
-                    shutil.copy2(src, dst)
-                _png_copy_stamped(dst, dst, label)
-            else:
+        for src, fname, is_primary, _kind in outputs:
+            dst = os.path.join(masks_dir, fname)
+            label = f"Masks/{fname[:-4]}"
+            try:
+                if mask_bg:
+                    if not _dilate_mask(src, dst, log, bg=mask_bg):
+                        shutil.copy2(src, dst)
+                    _png_copy_stamped(dst, dst, label)
+                else:
+                    _png_copy_stamped(src, dst, label)
+            except Exception as exc:
+                if log:
+                    log(f"  ERROR: mask '{option}' ({fname}) processing failed — {exc}")
                 _png_copy_stamped(src, dst, label)
-        except Exception as exc:
-            if log:
-                log(f"  ERROR: mask '{option}' processing failed — {exc}")
-            _png_copy_stamped(src, dst, label)
-        if log and not _png_has_alpha(dst):
-            log(f"  Warning: mask '{option}' has no alpha channel — Proteus uses "
-                f"the alpha (the Opacity channel) as the apply region. Add an "
-                f"Opacity channel so the mask knows which pixels to affect.")
+            if is_primary and log and not _png_has_alpha(dst):
+                log(f"  Warning: mask '{option}' has no alpha channel — Proteus uses "
+                    f"the alpha (the Opacity channel) as the apply region. Add an "
+                    f"Opacity channel so the mask knows which pixels to affect.")
 
     if _threads is not None:
         t = threading.Thread(target=_work, daemon=True, name=f"mask-bg-{option}")
