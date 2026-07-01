@@ -123,6 +123,9 @@ _TALL_FEMALE_FACES_PATHS = "\n".join([
 _DIFFUSE_DILATION_PX       = 16  # SP diffusion distance for color textures
 _MASK_DILATION_PX          =  8  # max paint-search radius for mask dilation
 _MASK_DILATION_INNER_PX    =  3  # max seam-proximity radius for mask dilation
+_MASK_MIN_SEED_PX          =  6  # isolated painted specks smaller than this
+                                  # (likely accidental stray dots) can't seed
+                                  # dilation growth into their neighbours
 
 _plugin_instance = None
 
@@ -1094,10 +1097,15 @@ class ProteusPackagerPlugin:
                                   f"{penumbra_root}")
                         return
                     target = os.path.join(penumbra_root, mod_name)
-                    if os.path.isdir(target):
-                        shutil.rmtree(target)
-                    shutil.copytree(pmp_root, target)
-                    self._log(f"Installed to Penumbra: {target}")
+                    os.makedirs(target, exist_ok=True)
+                    skipped = _sync_tree_resilient(pmp_root, target, log=self._log)
+                    if skipped:
+                        self._log(f"Installed to Penumbra with {skipped} file(s) "
+                                  f"skipped (locked — probably open in-game right "
+                                  f"now; re-export once it's closed to pick those "
+                                  f"up): {target}")
+                    else:
+                        self._log(f"Installed to Penumbra: {target}")
                     if _reload_penumbra_mod(target, name=mod_name, log=self._log):
                         self._log(f"Reloaded in Penumbra: {mod_name}")
                 else:
@@ -2015,6 +2023,78 @@ def _fetch_remote_file(url: str, timeout: float = 10.0):
         return None
 
 
+def _write_file_resilient(src_f: str, dst_f: str, log=None) -> bool:
+    """Write src_f's content to dst_f, surviving a destination that's
+    currently open for reading elsewhere (e.g. the game has this texture
+    loaded via Penumbra). A direct overwrite needs FILE_SHARE_WRITE from
+    every other open handle; Windows readers often only grant
+    FILE_SHARE_READ, which blocks that but still allows delete/rename. So
+    on failure, fall back to writing a temp file in the same directory and
+    os.replace()-ing it over the target — the same rename-swap trick this
+    plugin already uses for its own self-update. Returns True on success."""
+    try:
+        shutil.copy2(src_f, dst_f)
+        return True
+    except OSError:
+        pass
+
+    tmp_f = dst_f + ".tmp"
+    try:
+        shutil.copy2(src_f, tmp_f)
+        os.replace(tmp_f, dst_f)
+        return True
+    except OSError as exc:
+        if log:
+            log(f"  Warning: could not write {dst_f} "
+                f"(likely open elsewhere, e.g. the game) — left as-is: {exc}")
+        try:
+            os.remove(tmp_f)
+        except OSError:
+            pass
+        return False
+
+
+def _sync_tree_resilient(src_root: str, dst_root: str, log=None) -> int:
+    """Copy src_root's contents into dst_root in place (overwriting existing
+    files, removing stale ones), instead of shutil.rmtree()-ing dst_root and
+    recreating it. A delete-then-recreate aborts the *entire* install the
+    moment a single file is locked — e.g. the game currently has this mod's
+    textures open in Penumbra. Copying in place lets every unlocked file get
+    updated normally; a still-locked file is skipped (logged) and simply
+    picked up on the next export once whatever has it open releases it.
+    Returns the number of files that could not be written/removed."""
+    skipped = 0
+    for dirpath, _dirnames, filenames in os.walk(src_root):
+        rel = os.path.relpath(dirpath, src_root)
+        dst_dir = dst_root if rel == "." else os.path.join(dst_root, rel)
+        os.makedirs(dst_dir, exist_ok=True)
+        for fname in filenames:
+            src_f = os.path.join(dirpath, fname)
+            dst_f = os.path.join(dst_dir, fname)
+            if not _write_file_resilient(src_f, dst_f, log=log):
+                skipped += 1
+
+    # Remove stale files/dirs that no longer exist in the fresh export.
+    for dirpath, _dirnames, filenames in os.walk(dst_root, topdown=False):
+        rel = os.path.relpath(dirpath, dst_root)
+        src_dir = src_root if rel == "." else os.path.join(src_root, rel)
+        for fname in filenames:
+            if not os.path.isfile(os.path.join(src_dir, fname)):
+                try:
+                    os.remove(os.path.join(dirpath, fname))
+                except OSError as exc:
+                    skipped += 1
+                    if log:
+                        log(f"  Warning: could not remove stale file "
+                            f"{os.path.relpath(os.path.join(dirpath, fname), dst_root)}: {exc}")
+        if dirpath != dst_root and not os.path.isdir(src_dir):
+            try:
+                os.rmdir(dirpath)
+            except OSError:
+                pass
+    return skipped
+
+
 def _reload_penumbra_mod(path: str, name: str = "", log=None) -> bool:
     """POST to Penumbra's HTTP API to reload a mod in place. Both Path and Name are
     optional from Penumbra's side; we send Path (the on-disk folder) and Name
@@ -2453,13 +2533,30 @@ def _dilate_mask(src: str, dst: str, log=None, bg: tuple | None = None) -> bool:
         orig   = arr.copy()
         opaque = orig[:, :, 3] > 0
 
+        # Tiny isolated painted specks (a handful of pixels — typically an
+        # accidental stray brush dot, not real content) shouldn't act as a
+        # seed for growth. The speck itself is left alone (still copied
+        # through as-is via `opaque` below); it just can't spread into its
+        # neighbours and get amplified into a visible blob.
+        seed = opaque
+        try:
+            from scipy.ndimage import label as _speck_label
+            speck_lbl, n_speck = _speck_label(opaque, structure=np.ones((3, 3)))
+            if n_speck > 0:
+                speck_sizes = np.bincount(speck_lbl.ravel())
+                big_enough = speck_sizes >= _MASK_MIN_SEED_PX
+                big_enough[0] = False
+                seed = big_enough[speck_lbl]
+        except ImportError:
+            pass
+
         _dt_done = False
 
         # ── Tier 1: scipy (CPU, C-implemented) ───────────────────────────────
         if not _dt_done:
             try:
                 from scipy.ndimage import distance_transform_edt as _edt
-                _df, (_ry, _rx) = _edt(~opaque, return_indices=True)
+                _df, (_ry, _rx) = _edt(~seed, return_indices=True)
                 dist = _df.astype(np.int32)
                 sry  = _ry.astype(np.int32)
                 srx  = _rx.astype(np.int32)
@@ -2475,7 +2572,7 @@ def _dilate_mask(src: str, dst: str, log=None, bg: tuple | None = None) -> bool:
             dist = np.full((h, w), INF, dtype=np.int32)
             sry  = np.zeros((h, w), dtype=np.int32)
             srx  = np.zeros((h, w), dtype=np.int32)
-            oy, ox = np.where(opaque)
+            oy, ox = np.where(seed)
             dist[oy, ox] = 0; sry[oy, ox] = oy; srx[oy, ox] = ox
 
             for x in range(1, w):           # L→R
@@ -2546,7 +2643,7 @@ def _dilate_mask(src: str, dst: str, log=None, bg: tuple | None = None) -> bool:
                     bg_content = ~bg_a
                     isl, n_isl = _cc_label(bg_content, structure=np.ones((3, 3)))
                     if n_isl > 0:
-                        painted = (opaque & bg_content).ravel()
+                        painted = (seed & bg_content).ravel()
                         counts = np.bincount(isl.ravel()[painted], minlength=n_isl + 1)
                         painted_island = counts > 0
                         _, (iy, ix) = _edt(isl == 0, return_indices=True)
