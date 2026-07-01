@@ -25,9 +25,12 @@ import shutil
 import struct
 import tempfile
 import threading
+import time
 import zlib
 import configparser
 from pathlib import Path
+
+_scipy_install_attempted = False  # only try pip install once per session
 
 import substance_painter.ui
 import substance_painter.project
@@ -653,8 +656,10 @@ class ProteusPackagerPlugin:
                 # a meaningful 3D tile, so there is nothing to preview.
                 if _is_masks_group(group):
                     continue
+                prev_group = ""
                 for option in structure[group]:
-                    _set_visibility_for_option(ts_node_map, group, option)
+                    _set_visibility_for_option(ts_node_map, structure, group, option, prev_group)
+                    prev_group = group
                     _show_colorset_layers_for_option(ts_node_map, group, option)
                     pm = _grab_viewport_pixmap(self._log)
                     if pm is None:
@@ -724,7 +729,9 @@ class ProteusPackagerPlugin:
         ts_names = [ts.name() for ts in all_ts]
 
         # 1. Discover structure from layer stack
+        _t0 = time.time()
         structure, ts_node_map, colorset_layers = _discover_structure(all_ts)
+        self._log(f"[timing] discover_structure: {time.time()-_t0:.2f}s")
         if not structure:
             self._log("No group/option folder hierarchy found in the layer stack. "
                       "Add a top-level group folder (group) with sub-folders (options).")
@@ -773,10 +780,13 @@ class ProteusPackagerPlugin:
             os.makedirs(proteus_dir)
 
         # 3. Save current layer visibility
+        _t0 = time.time()
         saved_vis = _save_visibility(ts_node_map)
+        self._log(f"[timing] save_visibility: {time.time()-_t0:.2f}s")
 
         try:
             groups_order = list(structure.keys())
+            prev_group = ""
             option_groups_meta = []          # fresh-mode Proteus OptionGroups
             option_images: dict = {}         # (group, option) -> rel image path
             mask_threads: list = []
@@ -787,6 +797,7 @@ class ProteusPackagerPlugin:
                 _bg = _png_decode_rgba(self._gen3_mask_bg, self._log)
                 if _bg[0] is not None:
                     mask_bg = _bg
+                    _ensure_dilation_backend(self._log)
                 else:
                     self._log(f"  Warning: could not load Gen3 mask background: {self._gen3_mask_bg}")
 
@@ -878,10 +889,13 @@ class ProteusPackagerPlugin:
                     penumbra_opts = None
 
                 for option in structure[group]:
+                    QtWidgets.QApplication.processEvents()
                     self._log(f"Exporting {group}/{option}…")
 
-                    # Show only this option; hide everything else
-                    _set_visibility_for_option(ts_node_map, group, option)
+                    _t_vis = time.time()
+                    _set_visibility_for_option(ts_node_map, structure, group, option, prev_group)
+                    prev_group = group
+                    self._log(f"  [timing] set_visibility: {time.time()-_t_vis:.2f}s")
 
                     # Only export texture sets that still have at least one
                     # visible top-level node. Any TS that lacks the target
@@ -901,9 +915,11 @@ class ProteusPackagerPlugin:
                     # Ask SP to export
                     opt_export_dir = os.path.join(export_root, group, option)
                     os.makedirs(opt_export_dir, exist_ok=True)
+                    _t_exp = time.time()
                     exported_files = self._do_sp_export(
                         ts_names_export, opt_export_dir, resolved_preset,
                         passthrough=is_masks)
+                    self._log(f"  [timing] sp_export: {time.time()-_t_exp:.2f}s")
 
                     if not exported_files:
                         self._log(f"  No files produced — skipping {group}/{option}")
@@ -1000,8 +1016,10 @@ class ProteusPackagerPlugin:
 
             if mask_threads:
                 self._log(f"Finishing {len(mask_threads)} mask background composite(s)…")
+                _t0 = time.time()
                 for _t in mask_threads:
                     _t.join()
+                self._log(f"[timing] mask_join: {time.time()-_t0:.2f}s")
 
             if merge:
                 # Update the Proteus sidecar + only the touched group files;
@@ -1097,7 +1115,9 @@ class ProteusPackagerPlugin:
         except Exception as exc:
             self._log(f"Error: {exc}")
         finally:
+            _t0 = time.time()
             _restore_visibility(ts_node_map, saved_vis)
+            self._log(f"[timing] restore_visibility: {time.time()-_t0:.2f}s")
             shutil.rmtree(tmpdir, ignore_errors=True)
 
     def _do_sp_export(self, ts_names: list[str], output_dir: str,
@@ -1395,30 +1415,34 @@ def _discover_structure(all_ts: list):
     return structure, ts_node_map, colorset_layers
 
 
-def _set_visibility_for_option(ts_node_map: dict, group: str, option: str):
-    """
-    For every texture set:
-      - Hide all top-level nodes except the target group folder.
-      - Within the target group folder, hide all GroupLayer children except
-        the target option folder (non-group children are left untouched —
-        they are shared base content that should always render).
-    """
-    for ts_data in ts_node_map.values():
-        for node in ts_data.get("_top", []):
-            is_target_group = _is_group(node) and _node_name(node) == group
-            node.set_visible(is_target_group)
+def _set_visibility_for_option(ts_node_map: dict, structure: dict,
+                                group: str, option: str, prev_group: str = ""):
+    """Show only the target group/option; hide everything else.
 
-            if is_target_group:
-                for child in _node_children(node):
-                    if not _is_group(child):
-                        continue
-                    is_target_opt = _node_name(child) == option
-                    child.set_visible(is_target_opt)
-                    if is_target_opt:
-                        for sub in _node_children(child):
-                            if _is_group(sub) and _COLORSET_FOLDER_RE.match(_node_name(sub) or ""):
-                                for layer in _node_children(sub):
-                                    layer.set_visible(False)
+    When prev_group == group the top-level visibility state is unchanged so
+    those set_visible() calls are skipped — this avoids triggering SP
+    recalculations on every option when iterating within the same group.
+    Option nodes are looked up directly from ts_node_map instead of walking
+    _node_children() on every call."""
+    for ts_data in ts_node_map.values():
+        if prev_group != group:
+            for node in ts_data.get("_top", []):
+                is_target = _is_group(node) and _node_name(node) == group
+                node.set_visible(is_target)
+
+        group_entry = ts_data.get(group, {})
+        for opt_name in structure.get(group, []):
+            opt_node = group_entry.get(opt_name)
+            if opt_node is None:
+                continue
+            is_target = opt_name == option
+            opt_node.set_visible(is_target)
+            if is_target:
+                for sub in _node_children(opt_node):
+                    if (_is_group(sub)
+                            and _COLORSET_FOLDER_RE.match(_node_name(sub) or "")):
+                        for layer in _node_children(sub):
+                            layer.set_visible(False)
 
 
 def _show_colorset_layers_for_option(ts_node_map: dict, group: str, option: str):
@@ -1467,30 +1491,53 @@ def _set_viewport_3d_only(log=None):
 
 
 def _save_visibility(ts_node_map: dict) -> dict:
+    """Save visibility only for the nodes _set_visibility_for_option actually
+    mutates: top-level nodes, their direct group children (options), and the
+    fill layers inside any Colorset sub-folders.  Avoids walking the full layer
+    tree, which on a large file can mean thousands of unnecessary API calls."""
     saved: dict[str, bool] = {}
     for ts_name, ts_data in ts_node_map.items():
         for node in ts_data.get("_top", []):
-            _save_recursive(node, f"{ts_name}/{_node_name(node)}", saved)
+            key = f"{ts_name}/{_node_name(node)}"
+            saved[key] = _node_visible(node)
+            if not _is_group(node):
+                continue
+            for child in _node_children(node):
+                if not _is_group(child):
+                    continue
+                ckey = f"{key}/{_node_name(child)}"
+                saved[ckey] = _node_visible(child)
+                for sub in _node_children(child):
+                    if not (_is_group(sub) and _COLORSET_FOLDER_RE.match(_node_name(sub) or "")):
+                        continue
+                    for layer in _node_children(sub):
+                        saved[f"{ckey}/{_node_name(sub)}/{_node_name(layer)}"] = _node_visible(layer)
     return saved
 
 
 def _restore_visibility(ts_node_map: dict, saved: dict):
+    """Restore only the nodes recorded by the targeted _save_visibility, avoiding
+    set_visible() calls on fill layers that were never changed."""
     for ts_name, ts_data in ts_node_map.items():
         for node in ts_data.get("_top", []):
-            _restore_recursive(node, f"{ts_name}/{_node_name(node)}", saved)
-
-
-def _save_recursive(node, key: str, saved: dict):
-    saved[key] = _node_visible(node)
-    for child in _node_children(node):
-        _save_recursive(child, f"{key}/{_node_name(child)}", saved)
-
-
-def _restore_recursive(node, key: str, saved: dict):
-    if key in saved:
-        node.set_visible(saved[key])
-    for child in _node_children(node):
-        _restore_recursive(child, f"{key}/{_node_name(child)}", saved)
+            key = f"{ts_name}/{_node_name(node)}"
+            if key in saved:
+                node.set_visible(saved[key])
+            if not _is_group(node):
+                continue
+            for child in _node_children(node):
+                if not _is_group(child):
+                    continue
+                ckey = f"{key}/{_node_name(child)}"
+                if ckey in saved:
+                    child.set_visible(saved[ckey])
+                for sub in _node_children(child):
+                    if not (_is_group(sub) and _COLORSET_FOLDER_RE.match(_node_name(sub) or "")):
+                        continue
+                    for layer in _node_children(sub):
+                        lkey = f"{ckey}/{_node_name(sub)}/{_node_name(layer)}"
+                        if lkey in saved:
+                            layer.set_visible(saved[lkey])
 
 
 # ── SP API compatibility shims ────────────────────────────────────────────────
@@ -2247,7 +2294,18 @@ def _pick_mask_image(exported_files: list) -> str:
 
 def _png_decode_rgba(path: str, log=None) -> tuple:
     """Decode a PNG to a flat RGBA bytearray. Returns (pixels, w, h).
-    pixels is None on failure. Handles Gray, RGB, Gray+Alpha, RGBA."""
+    Uses PIL when available (milliseconds vs. minutes for large textures).
+    Falls back to a pure-Python decoder so PIL is not a hard requirement."""
+    try:
+        from PIL import Image as _PILImage
+        img = _PILImage.open(path).convert("RGBA")
+        w, h = img.size
+        return bytearray(img.tobytes()), w, h
+    except ImportError:
+        pass
+    except Exception as exc:
+        if log:
+            log(f"  Warning: PIL decode failed for {path}: {exc} — using fallback")
     try:
         with open(path, "rb") as f:
             data = f.read()
@@ -2322,6 +2380,54 @@ def _png_decode_rgba(path: str, log=None) -> tuple:
 
 
 
+def _ensure_dilation_backend(log=None) -> None:
+    """Detect (and install if missing) the fastest available dilation backend.
+    Must be called from the main thread — SP's console drops logs from threads."""
+    global _scipy_install_attempted
+    try:
+        __import__("scipy.ndimage")
+        if log:
+            log("  [dilation] backend: scipy CPU")
+        return
+    except ImportError:
+        pass
+
+    if not _scipy_install_attempted:
+        _scipy_install_attempted = True
+        if log:
+            log("  [dilation] scipy not found — installing (one-time, may take ~30s)…")
+        try:
+            import subprocess, sys, os
+            # sys.executable is the SP app binary in embedded Python, not python.exe
+            _py = os.path.join(sys.prefix, "python.exe")
+            if not os.path.isfile(_py):
+                _py = os.path.join(sys.prefix, "bin", "python3")
+            if not os.path.isfile(_py):
+                _py = os.path.join(sys.prefix, "bin", "python")
+            subprocess.run(
+                [_py, "-m", "pip", "install", "scipy", "--quiet"],
+                check=True, timeout=180)
+        except Exception as _e:
+            if log:
+                log(f"  [dilation] scipy install failed: {_e}")
+
+    try:
+        __import__("scipy.ndimage")
+        if log:
+            log("  [dilation] backend: scipy CPU (just installed)")
+        return
+    except ImportError:
+        pass
+
+    try:
+        __import__("numpy")
+        if log:
+            log("  [dilation] backend: numpy BFS (slow — scipy unavailable)")
+    except ImportError:
+        if log:
+            log("  [dilation] backend: pure Python (very slow — install scipy)")
+
+
 def _dilate_mask(src: str, dst: str, log=None, bg: tuple | None = None) -> bool:
     """Grow the painted (alpha>0) region of a mask outward, but only across UV
     seams. A transparent pixel is filled from its nearest painted pixel only
@@ -2331,6 +2437,110 @@ def _dilate_mask(src: str, dst: str, log=None, bg: tuple | None = None) -> bool:
     a UV-island border is wherever bg alpha-membership flips between neighbours
     (the bg's alpha polarity does not matter). Original opaque pixels are kept."""
     R = _MASK_DILATION_PX
+
+    # ── Fast path: CuPy/CUDA → scipy → numpy BFS → pure-Python ──────────────
+    try:
+        import numpy as np
+        from PIL import Image as _I
+
+        img = _I.open(src).convert("RGBA")
+        arr = np.asarray(img, dtype=np.uint8).copy()
+        h, w = arr.shape[:2]
+        orig   = arr.copy()
+        opaque = orig[:, :, 3] > 0
+
+        _dt_done = False
+
+        # ── Tier 1: scipy (CPU, C-implemented) ───────────────────────────────
+        if not _dt_done:
+            try:
+                from scipy.ndimage import distance_transform_edt as _edt
+                _df, (_ry, _rx) = _edt(~opaque, return_indices=True)
+                dist = _df.astype(np.int32)
+                sry  = _ry.astype(np.int32)
+                srx  = _rx.astype(np.int32)
+                _dt_done = True
+            except ImportError:
+                pass
+
+        # ── Tier 2: numpy 4-sweep raster BFS ─────────────────────────────────
+        if not _dt_done:
+            if log:
+                log(f"  [dilation] using numpy BFS (slow — install cupy or scipy)")
+            INF = R + 1
+            dist = np.full((h, w), INF, dtype=np.int32)
+            sry  = np.zeros((h, w), dtype=np.int32)
+            srx  = np.zeros((h, w), dtype=np.int32)
+            oy, ox = np.where(opaque)
+            dist[oy, ox] = 0; sry[oy, ox] = oy; srx[oy, ox] = ox
+
+            for x in range(1, w):           # L→R
+                c = dist[:, x-1] + 1; m = (c < dist[:, x]) & (c <= R)
+                dist[:, x] = np.where(m, c,          dist[:, x])
+                sry[:, x]  = np.where(m, sry[:, x-1], sry[:, x])
+                srx[:, x]  = np.where(m, srx[:, x-1], srx[:, x])
+            for x in range(w-2, -1, -1):    # R→L
+                c = dist[:, x+1] + 1; m = (c < dist[:, x]) & (c <= R)
+                dist[:, x] = np.where(m, c,          dist[:, x])
+                sry[:, x]  = np.where(m, sry[:, x+1], sry[:, x])
+                srx[:, x]  = np.where(m, srx[:, x+1], srx[:, x])
+            for y in range(1, h):            # T→B
+                c = dist[y-1] + 1; m = (c < dist[y]) & (c <= R)
+                dist[y] = np.where(m, c,       dist[y])
+                sry[y]  = np.where(m, sry[y-1], sry[y])
+                srx[y]  = np.where(m, srx[y-1], srx[y])
+            for y in range(h-2, -1, -1):     # B→T
+                c = dist[y+1] + 1; m = (c < dist[y]) & (c <= R)
+                dist[y] = np.where(m, c,       dist[y])
+                sry[y]  = np.where(m, sry[y+1], sry[y])
+                srx[y]  = np.where(m, srx[y+1], srx[y])
+
+        to_fill = (~opaque) & (dist <= R)
+
+        if bg is not None:
+            bg_pix, bw, bh = bg
+            if bw > 0 and bh > 0:
+                bg_img = _I.frombytes("RGBA", (bw, bh), bytes(bg_pix))
+                if (bw, bh) != (w, h):
+                    bg_img = bg_img.resize((w, h), _I.NEAREST)
+                bg_a = np.asarray(bg_img)[:, :, 3] > 0
+
+                seam = np.zeros((h, w), dtype=bool)
+                seam[:, :-1] |= bg_a[:, :-1] != bg_a[:, 1:]
+                seam[:, 1:]  |= bg_a[:, :-1] != bg_a[:, 1:]
+                seam[:-1, :] |= bg_a[:-1, :] != bg_a[1:, :]
+                seam[1:, :]  |= bg_a[:-1, :] != bg_a[1:, :]
+
+                R_INNER = _MASK_DILATION_INNER_PX
+                INF_E = R_INNER + 1
+                ed = np.full((h, w), INF_E, dtype=np.int32)
+                ed[seam] = 0
+                for x in range(1, w):
+                    c = ed[:, x-1] + 1
+                    ed[:, x] = np.where(c < ed[:, x], c, ed[:, x])
+                for x in range(w-2, -1, -1):
+                    c = ed[:, x+1] + 1
+                    ed[:, x] = np.where(c < ed[:, x], c, ed[:, x])
+                for y in range(1, h):
+                    c = ed[y-1] + 1
+                    ed[y] = np.where(c < ed[y], c, ed[y])
+                for y in range(h-2, -1, -1):
+                    c = ed[y+1] + 1
+                    ed[y] = np.where(c < ed[y], c, ed[y])
+                to_fill &= ed <= R_INNER
+
+        fy, fx = np.where(to_fill)
+        arr[fy, fx] = orig[sry[fy, fx], srx[fy, fx]]
+        _I.fromarray(arr).save(dst, "PNG")
+        return True
+
+    except ImportError:
+        pass
+    except Exception as exc:
+        if log:
+            log(f"  Warning: fast dilation failed ({exc}) — using pure-Python fallback")
+
+    # ── Pure-Python fallback ──────────────────────────────────────────────────
     px, w, h = _png_decode_rgba(src, log)
     if px is None:
         if log:
