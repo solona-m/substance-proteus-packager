@@ -121,8 +121,8 @@ _TALL_FEMALE_FACES_PATHS = "\n".join([
 ])
 
 _DIFFUSE_DILATION_PX       = 16  # SP diffusion distance for color textures
-_MASK_DILATION_PX          = 16  # max paint-search radius for mask dilation
-_MASK_DILATION_INNER_PX    =  5  # max seam-proximity radius for mask dilation
+_MASK_DILATION_PX          =  8  # max paint-search radius for mask dilation
+_MASK_DILATION_INNER_PX    =  3  # max seam-proximity radius for mask dilation
 
 _plugin_instance = None
 
@@ -2435,7 +2435,11 @@ def _dilate_mask(src: str, dst: str, log=None, bg: tuple | None = None) -> bool:
     _MASK_DILATION_PX of actual paint. This kills the seam line without bleeding
     into intentionally-neutral areas. bg is (pixels, w, h) from _png_decode_rgba;
     a UV-island border is wherever bg alpha-membership flips between neighbours
-    (the bg's alpha polarity does not matter). Original opaque pixels are kept."""
+    (the bg's alpha polarity does not matter). Original opaque pixels are kept.
+    A pixel is also only eligible if its own UV island (per bg) already
+    contains some real paint — otherwise an island this option never used at
+    all (e.g. an unrelated accessory shell sitting nearby in the atlas) could
+    get bled in purely because it's geometrically close to paint elsewhere."""
     R = _MASK_DILATION_PX
 
     # ── Fast path: CuPy/CUDA → scipy → numpy BFS → pure-Python ──────────────
@@ -2528,6 +2532,32 @@ def _dilate_mask(src: str, dst: str, log=None, bg: tuple | None = None) -> bool:
                     c = ed[y+1] + 1
                     ed[y] = np.where(c < ed[y], c, ed[y])
                 to_fill &= ed <= R_INNER
+
+                # Don't bridge into a UV island that this option never painted
+                # at all (e.g. an unrelated accessory shell that merely
+                # happens to sit within R/R_INNER of paint elsewhere on the
+                # atlas) — only islands that already contain some real paint
+                # are eligible for the seam-fill. NOTE: in this bg map the
+                # actual UV-island content lives in the *transparent* pixels
+                # — bg_a (alpha>0) is the margin, not the island — so island
+                # membership is labeled on ~bg_a, not bg_a.
+                try:
+                    from scipy.ndimage import label as _cc_label
+                    bg_content = ~bg_a
+                    isl, n_isl = _cc_label(bg_content, structure=np.ones((3, 3)))
+                    if n_isl > 0:
+                        painted = (opaque & bg_content).ravel()
+                        counts = np.bincount(isl.ravel()[painted], minlength=n_isl + 1)
+                        painted_island = counts > 0
+                        _, (iy, ix) = _edt(isl == 0, return_indices=True)
+                        nearest_isl = isl[iy, ix]
+                        to_fill &= painted_island[nearest_isl]
+                    else:
+                        to_fill[:] = False
+                except ImportError:
+                    if log:
+                        log("  [dilation] scipy unavailable — skipping island-paint "
+                            "guard (may bleed into unpainted islands)")
 
         fy, fx = np.where(to_fill)
         arr[fy, fx] = orig[sry[fy, fx], srx[fy, fx]]
