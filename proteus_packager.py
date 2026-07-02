@@ -162,6 +162,7 @@ class ProteusPackagerPlugin:
         }
         self._presets: dict[str, str] = {"Bibo+": _BIBO_PLUS_PATHS, "Gen3": _GEN3_PATHS, "Tall Female Faces": _TALL_FEMALE_FACES_PATHS}
         self._gen3_mask_bg = ""
+        self._bibo_mask_bg = ""
 
         self._load_settings()
         self._create_ui()
@@ -187,6 +188,8 @@ class ProteusPackagerPlugin:
         self._install_to_penumbra = cfg.getboolean("General", "InstallToPenumbra", fallback=False)
         _default_gen3_bg = os.path.join(os.path.dirname(__file__), "gen3_mask_background.png")
         self._gen3_mask_bg = g.get("Gen3MaskBackground", _default_gen3_bg)
+        _default_bibo_bg = os.path.join(os.path.dirname(__file__), "bibo_mask_background.png")
+        self._bibo_mask_bg = g.get("BiboMaskBackground", _default_bibo_bg)
         self._mat_preset_name = g.get("MaterialPreset", "Bibo+")
         self._material_paths = g.get("MaterialPaths", "").replace("\\n", "\n") or _BIBO_PLUS_PATHS
 
@@ -213,6 +216,7 @@ class ProteusPackagerPlugin:
             "MutuallyExclusive": str(self._mutually_exclusive),
             "InstallToPenumbra": str(self._install_to_penumbra),
             "Gen3MaskBackground": self._gen3_mask_bg,
+            "BiboMaskBackground": self._bibo_mask_bg,
             "MaterialPreset": self._mat_preset_name,
             "MaterialPaths": self._material_paths.replace("\n", "\\n"),
         }
@@ -794,15 +798,22 @@ class ProteusPackagerPlugin:
             option_images: dict = {}         # (group, option) -> rel image path
             mask_threads: list = []
 
-            # Decode the Gen3 mask background once; reused for every mask option.
+            # Decode the body's UV-island background once; reused for every
+            # mask option. Gen3 and Bibo+ are different body meshes with
+            # different UV layouts, so each needs its own background map.
             mask_bg: tuple | None = None
-            if "_b.mtrl" in self._material_paths and self._gen3_mask_bg:
-                _bg = _png_decode_rgba(self._gen3_mask_bg, self._log)
+            _bg_path, _bg_label = None, None
+            if "_bibo.mtrl" in self._material_paths and self._bibo_mask_bg:
+                _bg_path, _bg_label = self._bibo_mask_bg, "Bibo+"
+            elif "_b.mtrl" in self._material_paths and self._gen3_mask_bg:
+                _bg_path, _bg_label = self._gen3_mask_bg, "Gen3"
+            if _bg_path:
+                _bg = _png_decode_rgba(_bg_path, self._log)
                 if _bg[0] is not None:
                     mask_bg = _bg
                     _ensure_dilation_backend(self._log)
                 else:
-                    self._log(f"  Warning: could not load Gen3 mask background: {self._gen3_mask_bg}")
+                    self._log(f"  Warning: could not load {_bg_label} mask background: {_bg_path}")
 
             colorset_map: dict = {}
             # Manual override wins; otherwise re-detect fresh for this project
