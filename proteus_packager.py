@@ -614,6 +614,9 @@ class ProteusPackagerPlugin:
         self._update_btn.setText("✓ Updated — Python > Reload All Plugins")
         self._update_btn.setEnabled(False)
         self._log(f"Plugin file updated: {target}")
+        _update_proteus_export_preset(log=self._log)
+
+    # ── Export preset self-update ────────────────────────────────────────────
 
     # ── Button handler ────────────────────────────────────────────────────────
 
@@ -1142,7 +1145,7 @@ class ProteusPackagerPlugin:
 
     def _do_sp_export(self, ts_names: list[str], output_dir: str,
                       preset_url: str = "", passthrough: bool = False) -> list[str]:
-        if passthrough:
+       if passthrough:
             params = {"paddingAlgorithm": "passthrough"}
         else:
             params = {"paddingAlgorithm": "diffusion",
@@ -2002,6 +2005,10 @@ _PLUGIN_COMMITS_API = (
     "https://api.github.com/repos/solona-m/substance-proteus-packager/"
     "commits?path=proteus_packager.py&per_page=1"
 )
+_PROTEUS_SPEXP_REMOTE_URL = (
+    "https://raw.githubusercontent.com/solona-m/substance-proteus-packager/"
+    "main/Proteus.spexp"
+)
 
 
 def _remote_last_modified(timeout: float = 3.0):
@@ -2033,6 +2040,55 @@ def _fetch_remote_file(url: str, timeout: float = 10.0):
             return resp.read()
     except Exception:
         return None
+
+
+def _update_proteus_export_preset(log=None) -> None:
+    """Fetch the canonical Proteus.spexp from GitHub and install it as the
+    single export preset in the user's local shelf (…/assets/export-presets),
+    deleting any other Proteus*.spexp copies found there (including inside
+    Substance's .alg_meta shelf cache) so stale/duplicate versions edited
+    in-app via the Export Textures dialog can't shadow the correct one."""
+    content = _fetch_remote_file(_PROTEUS_SPEXP_REMOTE_URL)
+    if content is None:
+        if log:
+            log("  Proteus.spexp update failed — could not fetch from GitHub")
+        return
+
+    assets_dir = Path(__file__).parent.parent.parent / "assets" / "export-presets"
+    try:
+        assets_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        if log:
+            log(f"  Proteus.spexp update failed — could not create {assets_dir}: {exc}")
+        return
+
+    target = assets_dir / "Proteus.spexp"
+
+    removed = 0
+    for stale in assets_dir.rglob("*.spexp"):
+        if stale.stem.lower() != "proteus":
+            continue
+        try:
+            stale.unlink()
+            removed += 1
+        except OSError as exc:
+            if log:
+                log(f"  Warning: could not remove stale preset {stale}: {exc}")
+    if removed and log:
+        log(f"  Removed {removed} stale Proteus.spexp cop{'y' if removed == 1 else 'ies'}")
+
+    try:
+        with open(target, "wb") as f:
+            f.write(content)
+    except OSError as exc:
+        if log:
+            log(f"  Proteus.spexp update failed — could not write {target}: {exc}")
+        return
+
+    if log:
+        log(f"  Proteus.spexp installed: {target}")
+        log("  Note: re-select it in Settings > Export Preset (Refresh) so the "
+            "plugin picks up the new resource instead of a cached one.")
 
 
 def _write_file_resilient(src_f: str, dst_f: str, log=None) -> bool:
