@@ -126,6 +126,10 @@ _MASK_DILATION_INNER_PX    =  3  # max seam-proximity radius for mask dilation
 _MASK_MIN_SEED_PX          =  6  # isolated painted specks smaller than this
                                   # (likely accidental stray dots) can't seed
                                   # dilation growth into their neighbours
+_MASK_HOLE_FILL_PX         =  8  # tiny unpainted holes fully enclosed by paint
+                                  # (bake/rasterization noise, not real gaps)
+                                  # this small get closed regardless of UV-seam
+                                  # proximity
 
 _plugin_instance = None
 
@@ -2668,6 +2672,26 @@ def _dilate_mask(src: str, dst: str, log=None, bg: tuple | None = None) -> bool:
 
         to_fill = (~opaque) & (dist <= R)
 
+        # Tiny unpainted holes fully enclosed by paint are bake/rasterization
+        # noise (sub-pixel coverage rounding), not real content or seam gaps —
+        # close them unconditionally, independent of UV-seam proximity. A
+        # direct SP export using general "diffusion" padding absorbs this
+        # same noise automatically; our seam-restricted fill otherwise leaves
+        # it untouched since it's not near a UV border.
+        hole_fill = np.zeros_like(opaque)
+        try:
+            from scipy.ndimage import (label as _hole_label,
+                                        binary_fill_holes as _fill_holes)
+            interior_holes = _fill_holes(opaque) & ~opaque
+            hole_lbl, n_holes = _hole_label(interior_holes, structure=np.ones((3, 3)))
+            if n_holes:
+                hole_sizes = np.bincount(hole_lbl.ravel())
+                small_enough = hole_sizes <= _MASK_HOLE_FILL_PX
+                small_enough[0] = False
+                hole_fill = small_enough[hole_lbl] & (dist <= R)
+        except ImportError:
+            pass
+
         if bg is not None:
             bg_pix, bw, bh = bg
             if bw > 0 and bh > 0:
@@ -2725,6 +2749,8 @@ def _dilate_mask(src: str, dst: str, log=None, bg: tuple | None = None) -> bool:
                     if log:
                         log("  [dilation] scipy unavailable — skipping island-paint "
                             "guard (may bleed into unpainted islands)")
+
+        to_fill |= hole_fill
 
         fy, fx = np.where(to_fill)
         arr[fy, fx] = orig[sry[fy, fx], srx[fy, fx]]
