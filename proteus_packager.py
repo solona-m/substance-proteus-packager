@@ -1145,7 +1145,7 @@ class ProteusPackagerPlugin:
 
     def _do_sp_export(self, ts_names: list[str], output_dir: str,
                       preset_url: str = "", passthrough: bool = False) -> list[str]:
-       if passthrough:
+        if passthrough:
             params = {"paddingAlgorithm": "passthrough"}
         else:
             params = {"paddingAlgorithm": "diffusion",
