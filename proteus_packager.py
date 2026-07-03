@@ -121,8 +121,8 @@ _TALL_FEMALE_FACES_PATHS = "\n".join([
 ])
 
 _DIFFUSE_DILATION_PX       = 16  # SP diffusion distance for color textures
-_MASK_DILATION_PX          =  8  # max paint-search radius for mask dilation
-_MASK_DILATION_INNER_PX    =  3  # max seam-proximity radius for mask dilation
+_MASK_DILATION_PX          = 16  # max paint-search radius for mask dilation
+_MASK_DILATION_INNER_PX    =  8  # max seam-proximity radius for mask dilation
 _MASK_MIN_SEED_PX          =  6  # isolated painted specks smaller than this
                                   # (likely accidental stray dots) can't seed
                                   # dilation growth into their neighbours
@@ -131,11 +131,50 @@ _MASK_HOLE_FILL_PX         =  8  # tiny unpainted holes fully enclosed by paint
                                   # this small get closed regardless of UV-seam
                                   # proximity
 
+# texconv target format per texture type; None = keep lossless PNG.
+# Only diffuse tolerates lossy BC7. Normals use BC5 (the 2-channel normal
+# format). Index/Mask carry discrete/coverage values Proteus reads literally,
+# so any lossy block compression corrupts them — they stay lossless PNG.
+_COMPRESS_FORMAT = {
+    "Diffuse": "BC7_UNORM",   # perceptual color — BC7 is made for this
+    "Normal":  "BC5_UNORM",   # 2-channel normal format; BC7 mangles normals
+    "Index":   None,          # discrete row ids — any lossy step corrupts
+    "Mask":    None,          # hard coverage edges break under BC
+}
+
 _plugin_instance = None
+
+
+def _cleanup_stale_temp(log=None) -> int:
+    """Remove leftover proteus_pmp_* working dirs from prior runs that crashed
+    hard before their finally-block cleanup could run (or whose cleanup was
+    blocked by a locked file at the time). Each run's dir is normally deleted
+    in _build_pmp's finally; this is a startup safety net. Returns the count
+    removed. Never raises — best-effort."""
+    removed = 0
+    try:
+        tmp_root = tempfile.gettempdir()
+        for name in os.listdir(tmp_root):
+            if not name.startswith("proteus_pmp_"):
+                continue
+            path = os.path.join(tmp_root, name)
+            if not os.path.isdir(path):
+                continue
+            shutil.rmtree(path, ignore_errors=True)
+            if not os.path.exists(path):
+                removed += 1
+            elif log:
+                log(f"  Could not fully remove stale temp: {path}")
+    except OSError:
+        pass
+    if removed and log:
+        log(f"Cleaned up {removed} stale temp dir(s) from previous run(s)")
+    return removed
 
 
 def start_plugin():
     global _plugin_instance
+    _cleanup_stale_temp()
     _plugin_instance = ProteusPackagerPlugin()
 
 
@@ -169,6 +208,7 @@ class ProteusPackagerPlugin:
         self._bibo_mask_bg = ""
         self._texture_format = "bc7"          # "bc7" (BC7 .dds) or "png"
         self._texconv_path = _texconv_default_path()
+        self._export_resolution = 0           # px (4096/2048/…); 0 = document default
 
         self._load_settings()
         self._create_ui()
@@ -200,6 +240,10 @@ class ProteusPackagerPlugin:
         self._material_paths = g.get("MaterialPaths", "").replace("\\n", "\n") or _BIBO_PLUS_PATHS
         self._texture_format = (g.get("TextureFormat", "bc7") or "bc7").lower()
         self._texconv_path = g.get("TexConvPath", "") or _texconv_default_path()
+        try:
+            self._export_resolution = int(g.get("ExportResolution", "0") or "0")
+        except ValueError:
+            self._export_resolution = 0
 
         s = cfg["Suffixes"] if "Suffixes" in cfg else {}
         self._suffixes = {
@@ -229,6 +273,7 @@ class ProteusPackagerPlugin:
             "MaterialPaths": self._material_paths.replace("\n", "\\n"),
             "TextureFormat": self._texture_format,
             "TexConvPath": self._texconv_path,
+            "ExportResolution": str(self._export_resolution),
         }
         cfg["Suffixes"] = {k: ",".join(v) for k, v in self._suffixes.items()}
         user_presets = {k: v.replace("\n", "\\n") for k, v in self._presets.items()
@@ -438,11 +483,13 @@ class ProteusPackagerPlugin:
         # BC7 DDS export toggle + texconv path. When checked, exported overlay/
         # mask channels are converted PNG→BC7 .dds (via texconv) to shrink the
         # pack; metadata overlay paths point at the .dds. Uncheck for raw PNG.
-        self._bc7_check = QtWidgets.QCheckBox("Export textures as BC7 DDS")
+        self._bc7_check = QtWidgets.QCheckBox("Compress textures (BC7 diffuse / BC5 normal)")
         self._bc7_check.setChecked(self._texture_format == "bc7")
         self._bc7_check.setToolTip(
-            "Convert exported overlay/mask textures to BC7-compressed .dds using "
-            "texconv (auto-downloaded from Microsoft on plugin update). Much "
+            "Compress each exported channel with the format that suits it, using "
+            "texconv (auto-downloaded from Microsoft on plugin update): diffuse "
+            "→ BC7, normal → BC5. Index and masks stay lossless PNG — they carry "
+            "discrete/coverage values that lossy block compression corrupts. Much "
             "smaller packs. Uncheck to ship plain PNGs like before."
         )
         root.addWidget(self._bc7_check)
@@ -467,6 +514,30 @@ class ProteusPackagerPlugin:
             texconv_browse_btn.setEnabled(on)
         self._bc7_check.stateChanged.connect(lambda _=None: _sync_texconv_enabled())
         _sync_texconv_enabled()
+
+        # Output resolution — overrides the document/texture-set resolution at
+        # export time (SP `sizeLog2`). "Document default" leaves it untouched.
+        res_row = QtWidgets.QHBoxLayout()
+        res_row.addWidget(QtWidgets.QLabel("Output resolution"))
+        self._res_combo = QtWidgets.QComboBox()
+        # (label, pixel size; 0 = document default)
+        self._res_options = [
+            ("Document default", 0),
+            ("4096", 4096), ("2048", 2048), ("1024", 1024),
+            ("512", 512), ("256", 256),
+        ]
+        for label, _px in self._res_options:
+            self._res_combo.addItem(label)
+        _res_idx = next((i for i, (_l, px) in enumerate(self._res_options)
+                         if px == self._export_resolution), 0)
+        self._res_combo.setCurrentIndex(_res_idx)
+        self._res_combo.setToolTip(
+            "Resolution for exported textures. Overrides the project/texture-set "
+            "size. 'Document default' keeps whatever each texture set is set to."
+        )
+        res_row.addWidget(self._res_combo)
+        res_row.addStretch(1)
+        root.addLayout(res_row)
 
         preview_btn = QtWidgets.QPushButton("Generate previews")
         preview_btn.setToolTip(
@@ -512,6 +583,7 @@ class ProteusPackagerPlugin:
         self._install_penumbra_check.stateChanged.connect(self._read_ui_settings)
         self._bc7_check.stateChanged.connect(self._read_ui_settings)
         self._texconv_edit.editingFinished.connect(self._read_ui_settings)
+        self._res_combo.currentIndexChanged.connect(self._read_ui_settings)
         for edit in self._suffix_edits.values():
             edit.editingFinished.connect(self._read_ui_settings)
 
@@ -768,6 +840,7 @@ class ProteusPackagerPlugin:
         self._install_to_penumbra = self._install_penumbra_check.isChecked()
         self._texture_format = "bc7" if self._bc7_check.isChecked() else "png"
         self._texconv_path = self._texconv_edit.text().strip()
+        self._export_resolution = self._res_options[self._res_combo.currentIndex()][1]
         for key, edit in self._suffix_edits.items():
             self._suffixes[key] = _split_csv(edit.text())
         self._save_settings()
@@ -1064,8 +1137,9 @@ class ProteusPackagerPlugin:
                         fname = Path(fpath).name
                         dst_png = os.path.join(abs_subdir, fname)
                         _png_copy_stamped(fpath, dst_png, rel_subdir)
-                        if bc7_texconv:
-                            dds = _to_bc7_dds(dst_png, bc7_texconv,
+                        fmt = _COMPRESS_FORMAT.get(tex_type)
+                        if bc7_texconv and fmt:
+                            dds = _to_bc7_dds(dst_png, bc7_texconv, fmt=fmt,
                                               label=f"{rel_subdir}/{fname}",
                                               log=self._log)
                             if dds:
@@ -1220,6 +1294,15 @@ class ProteusPackagerPlugin:
         except Exception as exc:
             self._log(f"Error: {exc}")
         finally:
+            # Join any still-running mask-composite threads before deleting
+            # tmpdir, so they aren't mid-read/write on files we're removing
+            # (which would otherwise leave locked leftovers behind on an error
+            # path where the normal join above was skipped).
+            for _t in locals().get("mask_threads", []):
+                try:
+                    _t.join(timeout=30)
+                except Exception:
+                    pass
             _t0 = time.time()
             _restore_visibility(ts_node_map, saved_vis)
             self._log(f"[timing] restore_visibility: {time.time()-_t0:.2f}s")
@@ -1232,6 +1315,11 @@ class ProteusPackagerPlugin:
         else:
             params = {"paddingAlgorithm": "diffusion",
                       "dilationDistance": _DIFFUSE_DILATION_PX}
+        # Optional resolution override (SP sizeLog2 = log2 of square size);
+        # omitted entirely when "Document default" so each texture set keeps its
+        # own size.
+        if self._export_resolution and self._export_resolution >= 1:
+            params["sizeLog2"] = int(self._export_resolution).bit_length() - 1
         config = {
             "exportShaderParams": False,
             "exportPath": output_dir,
@@ -3126,7 +3214,7 @@ def _copy_mask_option(exported_files: list, proteus_dir: str, option: str,
             log(f"  {kind}: Masks/{fname}")
 
     def _work():
-        for src, fname, is_primary, _kind in outputs:
+        for src, fname, is_primary, kind in outputs:
             dst = os.path.join(masks_dir, fname)
             label = f"Masks/{fname[:-4]}"
             try:
@@ -3146,8 +3234,9 @@ def _copy_mask_option(exported_files: list, proteus_dir: str, option: str,
                 log(f"  Warning: mask '{option}' has no alpha channel — Proteus uses "
                     f"the alpha (the Opacity channel) as the apply region. Add an "
                     f"Opacity channel so the mask knows which pixels to affect.")
-            if texconv:
-                _to_bc7_dds(dst, texconv, label=label, log=log)
+            fmt = _COMPRESS_FORMAT.get(kind)
+            if texconv and fmt:
+                _to_bc7_dds(dst, texconv, fmt=fmt, label=label, log=log)
 
     if _threads is not None:
         t = threading.Thread(target=_work, daemon=True, name=f"mask-bg-{option}")
@@ -3212,9 +3301,10 @@ _DDS_DEDUP_PREFIX = b"\x00PxOpt:"  # trailing marker; see _to_bc7_dds
 
 def _to_bc7_dds(png_path: str, texconv: str, fmt: str = "BC7_UNORM",
                 label: str = "", log=None) -> str | None:
-    """Convert a PNG to a BC7 .dds (via texconv) written beside it, delete the
-    source PNG, and return the .dds path. Returns None on any failure so the
-    caller can keep the PNG (export never hard-fails).
+    """Convert a PNG to a BC-compressed .dds (via texconv) written beside it,
+    delete the source PNG, and return the .dds path. `fmt` is a texconv format
+    (e.g. "BC7_UNORM" for diffuse, "BC5_UNORM" for normals). Returns None on any
+    failure so the caller can keep the PNG (export never hard-fails).
 
     A unique trailing marker is appended after the DDS payload so byte-identical
     textures across options stay distinct and Penumbra's auto-deduplicate won't
@@ -3222,14 +3312,21 @@ def _to_bc7_dds(png_path: str, texconv: str, fmt: str = "BC7_UNORM",
     readers stop at the header-declared mip chain and ignore trailing bytes)."""
     import subprocess
 
+    # Short tag for logs, e.g. "BC7" / "BC5".
+    tag = fmt.split("_")[0]
+
     if not texconv or not os.path.isfile(texconv):
         if log:
-            log(f"  BC7: texconv not found ({texconv or 'unset'}) — keeping PNG")
+            log(f"  {tag}: texconv not found ({texconv or 'unset'}) — keeping PNG")
         return None
 
     out_dir = os.path.dirname(png_path)
     dds_path = os.path.join(out_dir, Path(png_path).stem + ".dds")
-    cmd = [texconv, "-nologo", "-y", "-m", "1", "-f", fmt, "-o", out_dir, png_path]
+    # -dx10 forces the extended DX10 header (DXGI format in DDS_HEADER_DXT10)
+    # rather than a legacy FourCC. BC7 requires it anyway, and it gives BC5 an
+    # unambiguous DXGI format tag so Proteus resolves it consistently.
+    cmd = [texconv, "-nologo", "-y", "-m", "1", "-dx10",
+           "-f", fmt, "-o", out_dir, png_path]
 
     # CREATE_NO_WINDOW (0x08000000) stops a console flashing over Substance's UI.
     _flags = 0x08000000 if os.name == "nt" else 0
@@ -3239,13 +3336,13 @@ def _to_bc7_dds(png_path: str, texconv: str, fmt: str = "BC7_UNORM",
     except (subprocess.CalledProcessError, OSError) as exc:
         stderr = getattr(exc, "stderr", b"") or b""
         if log:
-            log(f"  BC7: texconv failed on {Path(png_path).name} — keeping PNG "
+            log(f"  {tag}: texconv failed on {Path(png_path).name} — keeping PNG "
                 f"({exc}; {stderr[:200].decode('utf-8', 'replace').strip()})")
         return None
 
     if not os.path.isfile(dds_path):
         if log:
-            log(f"  BC7: texconv produced no .dds for {Path(png_path).name} — "
+            log(f"  {tag}: texconv produced no .dds for {Path(png_path).name} — "
                 f"keeping PNG")
         return None
 
