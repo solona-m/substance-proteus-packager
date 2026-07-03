@@ -167,6 +167,8 @@ class ProteusPackagerPlugin:
         self._presets: dict[str, str] = {"Bibo+": _BIBO_PLUS_PATHS, "Gen3": _GEN3_PATHS, "Tall Female Faces": _TALL_FEMALE_FACES_PATHS}
         self._gen3_mask_bg = ""
         self._bibo_mask_bg = ""
+        self._texture_format = "bc7"          # "bc7" (BC7 .dds) or "png"
+        self._texconv_path = _texconv_default_path()
 
         self._load_settings()
         self._create_ui()
@@ -196,6 +198,8 @@ class ProteusPackagerPlugin:
         self._bibo_mask_bg = g.get("BiboMaskBackground", _default_bibo_bg)
         self._mat_preset_name = g.get("MaterialPreset", "Bibo+")
         self._material_paths = g.get("MaterialPaths", "").replace("\\n", "\n") or _BIBO_PLUS_PATHS
+        self._texture_format = (g.get("TextureFormat", "bc7") or "bc7").lower()
+        self._texconv_path = g.get("TexConvPath", "") or _texconv_default_path()
 
         s = cfg["Suffixes"] if "Suffixes" in cfg else {}
         self._suffixes = {
@@ -223,6 +227,8 @@ class ProteusPackagerPlugin:
             "BiboMaskBackground": self._bibo_mask_bg,
             "MaterialPreset": self._mat_preset_name,
             "MaterialPaths": self._material_paths.replace("\n", "\\n"),
+            "TextureFormat": self._texture_format,
+            "TexConvPath": self._texconv_path,
         }
         cfg["Suffixes"] = {k: ",".join(v) for k, v in self._suffixes.items()}
         user_presets = {k: v.replace("\n", "\\n") for k, v in self._presets.items()
@@ -429,6 +435,39 @@ class ProteusPackagerPlugin:
         self._mutex_check.setChecked(self._mutually_exclusive)
         root.addWidget(self._mutex_check)
 
+        # BC7 DDS export toggle + texconv path. When checked, exported overlay/
+        # mask channels are converted PNG→BC7 .dds (via texconv) to shrink the
+        # pack; metadata overlay paths point at the .dds. Uncheck for raw PNG.
+        self._bc7_check = QtWidgets.QCheckBox("Export textures as BC7 DDS")
+        self._bc7_check.setChecked(self._texture_format == "bc7")
+        self._bc7_check.setToolTip(
+            "Convert exported overlay/mask textures to BC7-compressed .dds using "
+            "texconv (auto-downloaded from Microsoft on plugin update). Much "
+            "smaller packs. Uncheck to ship plain PNGs like before."
+        )
+        root.addWidget(self._bc7_check)
+
+        texconv_row = QtWidgets.QHBoxLayout()
+        texconv_row.addWidget(QtWidgets.QLabel("TexConv path"))
+        self._texconv_edit = QtWidgets.QLineEdit(self._texconv_path)
+        self._texconv_edit.setToolTip(
+            "Path to texconv.exe (Microsoft DirectXTex). Auto-downloaded next to "
+            "the plugin on update; override here if you keep it elsewhere."
+        )
+        texconv_row.addWidget(self._texconv_edit)
+        texconv_browse_btn = QtWidgets.QPushButton("...")
+        texconv_browse_btn.setFixedWidth(30)
+        texconv_browse_btn.clicked.connect(self._browse_texconv)
+        texconv_row.addWidget(texconv_browse_btn)
+        root.addLayout(texconv_row)
+
+        def _sync_texconv_enabled():
+            on = self._bc7_check.isChecked()
+            self._texconv_edit.setEnabled(on)
+            texconv_browse_btn.setEnabled(on)
+        self._bc7_check.stateChanged.connect(lambda _=None: _sync_texconv_enabled())
+        _sync_texconv_enabled()
+
         preview_btn = QtWidgets.QPushButton("Generate previews")
         preview_btn.setToolTip(
             "For each option in the layer stack, switch to 3D-only view, "
@@ -471,6 +510,8 @@ class ProteusPackagerPlugin:
         self._export_preset_combo.currentIndexChanged.connect(self._read_ui_settings)
         self._mutex_check.stateChanged.connect(self._read_ui_settings)
         self._install_penumbra_check.stateChanged.connect(self._read_ui_settings)
+        self._bc7_check.stateChanged.connect(self._read_ui_settings)
+        self._texconv_edit.editingFinished.connect(self._read_ui_settings)
         for edit in self._suffix_edits.values():
             edit.editingFinished.connect(self._read_ui_settings)
 
@@ -488,6 +529,15 @@ class ProteusPackagerPlugin:
         )
         if f:
             self._existing_pmp_edit.setText(f)
+            self._read_ui_settings()
+
+    def _browse_texconv(self):
+        f, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self._widget, "Select texconv.exe", self._texconv_edit.text(),
+            "texconv (texconv.exe);;Executables (*.exe);;All files (*)"
+        )
+        if f:
+            self._texconv_edit.setText(f)
             self._read_ui_settings()
 
     def _on_colorset_meta_edited(self, _text):
@@ -619,6 +669,7 @@ class ProteusPackagerPlugin:
         self._update_btn.setEnabled(False)
         self._log(f"Plugin file updated: {target}")
         _update_proteus_export_preset(log=self._log)
+        _update_texconv(log=self._log)
 
     # ── Export preset self-update ────────────────────────────────────────────
 
@@ -715,6 +766,8 @@ class ProteusPackagerPlugin:
         self._mat_preset_name = self._mat_preset_combo.currentText()
         self._mutually_exclusive = self._mutex_check.isChecked()
         self._install_to_penumbra = self._install_penumbra_check.isChecked()
+        self._texture_format = "bc7" if self._bc7_check.isChecked() else "png"
+        self._texconv_path = self._texconv_edit.text().strip()
         for key, edit in self._suffix_edits.items():
             self._suffixes[key] = _split_csv(edit.text())
         self._save_settings()
@@ -821,6 +874,24 @@ class ProteusPackagerPlugin:
                     _ensure_dilation_backend(self._log)
                 else:
                     self._log(f"  Warning: could not load {_bg_label} mask background: {_bg_path}")
+
+            # Resolve BC7 texconv once for the whole export. None means "ship
+            # PNG" (either the toggle is off, or texconv is unavailable and
+            # couldn't be downloaded — in which case we fall back to PNG rather
+            # than failing the export).
+            bc7_texconv: str | None = None
+            if self._texture_format == "bc7":
+                tc = self._texconv_path or _texconv_default_path()
+                if not os.path.isfile(tc):
+                    self._log(f"  BC7: texconv not found at {tc} — downloading…")
+                    if _update_texconv(log=self._log, dst=_texconv_default_path()):
+                        tc = _texconv_default_path()
+                if os.path.isfile(tc):
+                    bc7_texconv = tc
+                    self._log(f"  BC7 DDS export enabled (texconv: {tc})")
+                else:
+                    self._log("  BC7: texconv unavailable — falling back to PNG "
+                              "output for this export")
 
             colorset_map: dict = {}
             # Manual override wins; otherwise re-detect fresh for this project
@@ -956,7 +1027,8 @@ class ProteusPackagerPlugin:
                         if not _copy_mask_option(exported_files, proteus_dir,
                                                  final_name, self._log,
                                                  mask_bg, mask_threads,
-                                                 detect_type=self._detect_type):
+                                                 detect_type=self._detect_type,
+                                                 texconv=bc7_texconv):
                             self._log(f"  No usable mask image — skipping {group}/{option}")
                             continue
                         image_rel = _maybe_copy_preview_into_pack(
@@ -990,8 +1062,14 @@ class ProteusPackagerPlugin:
                             self._log(f"  Skipping unrecognised: {Path(fpath).name}")
                             continue
                         fname = Path(fpath).name
-                        _png_copy_stamped(fpath, os.path.join(abs_subdir, fname),
-                                          rel_subdir)
+                        dst_png = os.path.join(abs_subdir, fname)
+                        _png_copy_stamped(fpath, dst_png, rel_subdir)
+                        if bc7_texconv:
+                            dds = _to_bc7_dds(dst_png, bc7_texconv,
+                                              label=f"{rel_subdir}/{fname}",
+                                              log=self._log)
+                            if dds:
+                                fname = Path(dds).name
                         overlay[tex_type] = f"{rel_subdir}/{fname}"
                         self._log(f"  {tex_type}: {rel_subdir}/{fname}")
 
@@ -2013,6 +2091,18 @@ _PROTEUS_SPEXP_REMOTE_URL = (
     "https://raw.githubusercontent.com/solona-m/substance-proteus-packager/"
     "main/Proteus.spexp"
 )
+# Microsoft DirectXTex's official texconv.exe (MIT-licensed). The
+# /releases/latest/download/ path always redirects to the newest release's
+# asset; urllib follows the 302 chain. Pulled from Microsoft rather than
+# bundled in this repo so no binary lives in git history.
+_TEXCONV_REMOTE_URL = (
+    "https://github.com/microsoft/DirectXTex/releases/latest/download/texconv.exe"
+)
+
+
+def _texconv_default_path() -> str:
+    """Default local texconv.exe location: alongside this plugin file."""
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "texconv.exe")
 
 
 def _remote_last_modified(timeout: float = 3.0):
@@ -2093,6 +2183,44 @@ def _update_proteus_export_preset(log=None) -> None:
         log(f"  Proteus.spexp installed: {target}")
         log("  Note: re-select it in Settings > Export Preset (Refresh) so the "
             "plugin picks up the new resource instead of a cached one.")
+
+
+def _update_texconv(log=None, dst: str | None = None) -> bool:
+    """Download Microsoft DirectXTex's texconv.exe next to this plugin (or to
+    `dst`). Returns True on success. Never clobbers an existing good copy with a
+    failed fetch — a network error is a silent no-op so a working texconv stays
+    put. Used both by the plugin self-update flow and as an on-demand fallback
+    when BC7 export is requested but texconv is missing."""
+    target = dst or _texconv_default_path()
+    content = _fetch_remote_file(_TEXCONV_REMOTE_URL, timeout=60.0)
+    if content is None:
+        if log:
+            log("  texconv.exe download failed — could not fetch from Microsoft "
+                "(DirectXTex releases)")
+        return False
+    # ~1 MB binary; guard against a redirect landing on an HTML error page.
+    if len(content) < 100_000 or content[:2] != b"MZ":
+        if log:
+            log(f"  texconv.exe download looks wrong ({len(content)} bytes, not a "
+                f"PE binary) — leaving any existing copy in place")
+        return False
+    try:
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        tmp = target + ".tmp"
+        with open(tmp, "wb") as f:
+            f.write(content)
+        os.replace(tmp, target)
+    except OSError as exc:
+        if log:
+            log(f"  texconv.exe install failed — could not write {target}: {exc}")
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return False
+    if log:
+        log(f"  texconv.exe installed: {target}")
+    return True
 
 
 def _write_file_resilient(src_f: str, dst_f: str, log=None) -> bool:
@@ -2953,7 +3081,7 @@ def _dilate_mask(src: str, dst: str, log=None, bg: tuple | None = None) -> bool:
 def _copy_mask_option(exported_files: list, proteus_dir: str, option: str,
                       log=None, mask_bg: tuple | None = None,
                       _threads: list | None = None,
-                      detect_type=None) -> bool:
+                      detect_type=None, texconv: str | None = None) -> bool:
     """Write a Masks option's exported channels into Proteus/Masks/ (stamped):
     the alpha-bearing Diffuse/Mask channel as <option>.png — Proteus reads its
     alpha as the apply region — plus Normal as <option>_n.png and Index as
@@ -2963,7 +3091,10 @@ def _copy_mask_option(exported_files: list, proteus_dir: str, option: str,
     _detect_type). If mask_bg is provided (decoded RGBA of the UV-boundary map
     PNG), the same seam-gap dilation applied to the Diffuse/Mask channel is
     also applied to Normal/Index — they share the same UV layout and gaps.
-    Processing runs on a background thread when _threads is given."""
+    If texconv is given, each stamped PNG is converted to BC7 .dds in place
+    (mask files are referenced by naming convention, so only the on-disk
+    extension changes). Processing runs on a background thread when _threads
+    is given."""
     if not exported_files:
         return False
 
@@ -3009,10 +3140,14 @@ def _copy_mask_option(exported_files: list, proteus_dir: str, option: str,
                 if log:
                     log(f"  ERROR: mask '{option}' ({fname}) processing failed — {exc}")
                 _png_copy_stamped(src, dst, label)
+            # Alpha check must run on the PNG (reads the PNG header) before any
+            # BC7 conversion below.
             if is_primary and log and not _png_has_alpha(dst):
                 log(f"  Warning: mask '{option}' has no alpha channel — Proteus uses "
                     f"the alpha (the Opacity channel) as the apply region. Add an "
                     f"Opacity channel so the mask knows which pixels to affect.")
+            if texconv:
+                _to_bc7_dds(dst, texconv, label=label, log=log)
 
     if _threads is not None:
         t = threading.Thread(target=_work, daemon=True, name=f"mask-bg-{option}")
@@ -3070,6 +3205,62 @@ def _png_copy_stamped(src: str, dst: str, label: str) -> None:
         f.write(data[:-12])   # everything before IEND
         f.write(text_chunk)
         f.write(_PNG_IEND)
+
+
+_DDS_DEDUP_PREFIX = b"\x00PxOpt:"  # trailing marker; see _to_bc7_dds
+
+
+def _to_bc7_dds(png_path: str, texconv: str, fmt: str = "BC7_UNORM",
+                label: str = "", log=None) -> str | None:
+    """Convert a PNG to a BC7 .dds (via texconv) written beside it, delete the
+    source PNG, and return the .dds path. Returns None on any failure so the
+    caller can keep the PNG (export never hard-fails).
+
+    A unique trailing marker is appended after the DDS payload so byte-identical
+    textures across options stay distinct and Penumbra's auto-deduplicate won't
+    collapse them (the DDS equivalent of _png_copy_stamped's tEXt chunk; DDS
+    readers stop at the header-declared mip chain and ignore trailing bytes)."""
+    import subprocess
+
+    if not texconv or not os.path.isfile(texconv):
+        if log:
+            log(f"  BC7: texconv not found ({texconv or 'unset'}) — keeping PNG")
+        return None
+
+    out_dir = os.path.dirname(png_path)
+    dds_path = os.path.join(out_dir, Path(png_path).stem + ".dds")
+    cmd = [texconv, "-nologo", "-y", "-m", "1", "-f", fmt, "-o", out_dir, png_path]
+
+    # CREATE_NO_WINDOW (0x08000000) stops a console flashing over Substance's UI.
+    _flags = 0x08000000 if os.name == "nt" else 0
+    try:
+        subprocess.run(cmd, check=True, creationflags=_flags,
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except (subprocess.CalledProcessError, OSError) as exc:
+        stderr = getattr(exc, "stderr", b"") or b""
+        if log:
+            log(f"  BC7: texconv failed on {Path(png_path).name} — keeping PNG "
+                f"({exc}; {stderr[:200].decode('utf-8', 'replace').strip()})")
+        return None
+
+    if not os.path.isfile(dds_path):
+        if log:
+            log(f"  BC7: texconv produced no .dds for {Path(png_path).name} — "
+                f"keeping PNG")
+        return None
+
+    try:
+        with open(dds_path, "ab") as f:
+            f.write(_DDS_DEDUP_PREFIX + label.encode("latin-1", errors="replace"))
+    except OSError:
+        pass  # dedup stamp is best-effort; a working .dds is still usable
+
+    try:
+        os.remove(png_path)
+    except OSError:
+        pass
+
+    return dds_path
 
 
 def _write_json(path: str, data):
