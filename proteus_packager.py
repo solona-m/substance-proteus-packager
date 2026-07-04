@@ -121,8 +121,8 @@ _TALL_FEMALE_FACES_PATHS = "\n".join([
 ])
 
 _DIFFUSE_DILATION_PX       = 16  # SP diffusion distance for color textures
-_MASK_DILATION_PX          = 16  # max paint-search radius for mask dilation
-_MASK_DILATION_INNER_PX    =  8  # max seam-proximity radius for mask dilation
+_MASK_DILATION_PX          =  8  # max paint-search radius for mask dilation
+_MASK_DILATION_INNER_PX    =  3  # max seam-proximity radius for mask dilation
 _MASK_MIN_SEED_PX          =  6  # isolated painted specks smaller than this
                                   # (likely accidental stray dots) can't seed
                                   # dilation growth into their neighbours
@@ -3166,6 +3166,50 @@ def _dilate_mask(src: str, dst: str, log=None, bg: tuple | None = None) -> bool:
         return False
 
 
+def _snap_index_rows(path: str, log=None) -> bool:
+    """Harden a Proteus index (_id) map so its R channel (the colorset row
+    selector) holds only discrete real rows and its alpha is a hard mask.
+
+    A row selector must never be antialiased: at a soft edge the R value ramps
+    between the mask's row and the transparent/neighbouring value, and Proteus
+    reads those in-between R values as *different* colorset rows — the stray
+    wrong-colour speckle seen along mask edges (e.g. a row-16 mask fringing into
+    row 15/14 where R ramps 255→0 into the transparent negative space). Soft
+    alpha causes the same thing at composite time, blending the fabric row
+    against the mask row.
+
+    Real rows are auto-detected as the R values present in fully-opaque pixels
+    (antialiased edges are semi-transparent, so they're excluded); every pixel's
+    R is snapped to the nearest real row and alpha is thresholded to 0/255. The
+    G channel (subrow A/B blend) is an intentional gradient and is left exactly
+    as-is. Returns True on success; False if it couldn't run (caller keeps the
+    original file)."""
+    try:
+        import numpy as np
+        from PIL import Image
+    except ImportError:
+        return False
+    try:
+        a = np.asarray(Image.open(path).convert("RGBA")).copy()
+        R, A = a[:, :, 0], a[:, :, 3]
+        real = np.unique(R[A >= 250])          # rows actually painted (opaque)
+        if real.size == 0:
+            return False
+        idx = np.abs(R.astype(np.int16)[:, :, None]
+                     - real.astype(np.int16)[None, None, :]).argmin(2)
+        a[:, :, 0] = real[idx]                  # snap row to nearest real row
+        a[:, :, 3] = np.where(A >= 128, 255, 0).astype(np.uint8)  # hard mask
+        Image.fromarray(a, "RGBA").save(path, "PNG")
+        if log:
+            log(f"  index rows snapped to {real.tolist()} "
+                f"({os.path.basename(path)})")
+        return True
+    except Exception as exc:
+        if log:
+            log(f"  Warning: index row-snap failed on {os.path.basename(path)} — {exc}")
+        return False
+
+
 def _copy_mask_option(exported_files: list, proteus_dir: str, option: str,
                       log=None, mask_bg: tuple | None = None,
                       _threads: list | None = None,
@@ -3228,6 +3272,12 @@ def _copy_mask_option(exported_files: list, proteus_dir: str, option: str,
                 if log:
                     log(f"  ERROR: mask '{option}' ({fname}) processing failed — {exc}")
                 _png_copy_stamped(src, dst, label)
+            # The index (_id) is a discrete colorset-row selector — snap its R to
+            # real rows and harden its alpha so antialiased edges can't read as
+            # wrong rows (the G subrow gradient is preserved). Re-stamp after,
+            # since the rewrite drops the dedup chunk.
+            if kind == "Index" and _snap_index_rows(dst, log):
+                _png_copy_stamped(dst, dst, label)
             # Alpha check must run on the PNG (reads the PNG header) before any
             # BC7 conversion below.
             if is_primary and log and not _png_has_alpha(dst):
