@@ -2802,7 +2802,8 @@ def _ensure_dilation_backend(log=None) -> None:
             log("  [dilation] backend: pure Python (very slow — install scipy)")
 
 
-def _dilate_mask(src: str, dst: str, log=None, bg: tuple | None = None) -> bool:
+def _dilate_mask(src: str, dst: str, log=None, bg: tuple | None = None,
+                 harden_seams: bool = False) -> bool:
     """Grow the painted (alpha>0) region of a mask outward, but only across UV
     seams. A transparent pixel is filled from its nearest painted pixel only
     when it lies within _MASK_DILATION_INNER_PX of a UV-island border AND within
@@ -2969,8 +2970,13 @@ def _dilate_mask(src: str, dst: str, log=None, bg: tuple | None = None) -> bool:
                         # opacity → a faint half-applied line at every island
                         # boundary. Solidify the garment's own antialiased edge
                         # inside the band (the silhouette edge, away from seams,
-                        # keeps its soft edge).
-                        harden = opaque & (ed <= R_INNER) & painted_island[nearest_isl]
+                        # keeps its soft edge). ONLY for the coverage/primary —
+                        # solidifying a *discrete* map (index) here would copy
+                        # antialiased edge values into solid fills, manufacturing
+                        # fake in-between rows.
+                        if harden_seams:
+                            harden = (opaque & (ed <= R_INNER)
+                                      & painted_island[nearest_isl])
                     else:
                         to_fill[:] = False
                 except ImportError:
@@ -3223,9 +3229,30 @@ def _bleed_content(path: str, radius: int = _MASK_CONTENT_BLEED_PX, log=None) ->
         return False
 
 
-def _snap_index_rows(path: str, log=None) -> bool:
+def _detect_index_rows(path: str):
+    """Return the set of real colorset rows (unique R values in fully-opaque
+    pixels) from a *clean* index map — call this on the original SP export,
+    before any dilation/hardening can turn antialiased edge values into solid
+    fake rows. Returns a numpy array, or None if it can't read the file."""
+    try:
+        import numpy as np
+        from PIL import Image
+    except ImportError:
+        return None
+    try:
+        a = np.asarray(Image.open(path).convert("RGBA"))
+        real = np.unique(a[:, :, 0][a[:, :, 3] >= 250])
+        return real if real.size else None
+    except Exception:
+        return None
+
+
+def _snap_index_rows(path: str, log=None, real=None) -> bool:
     """Harden a Proteus index (_id) map so its R channel (the colorset row
     selector) holds only discrete real rows and its alpha is a hard mask.
+    `real` is the valid-row set to snap to — pass the rows detected from the
+    original SP export (via _detect_index_rows) so solidified antialiased fills
+    can't be mistaken for real rows; if omitted it's detected from this file.
 
     A row selector must never be antialiased: at a soft edge the R value ramps
     between the mask's row and the transparent/neighbouring value, and Proteus
@@ -3249,7 +3276,9 @@ def _snap_index_rows(path: str, log=None) -> bool:
     try:
         a = np.asarray(Image.open(path).convert("RGBA")).copy()
         R, A = a[:, :, 0], a[:, :, 3]
-        real = np.unique(R[A >= 250])          # rows actually painted (opaque)
+        if real is None:
+            real = np.unique(R[A >= 250])      # rows actually painted (opaque)
+        real = np.asarray(real)
         if real.size == 0:
             return False
         idx = np.abs(R.astype(np.int16)[:, :, None]
@@ -3318,11 +3347,16 @@ def _copy_mask_option(exported_files: list, proteus_dir: str, option: str,
         for src, fname, is_primary, kind in outputs:
             dst = os.path.join(masks_dir, fname)
             label = f"Masks/{fname[:-4]}"
+            # Detect the real rows from the pristine SP export up front — after
+            # dilation solidifies antialiased fills, those in-between R values
+            # would otherwise look like extra "rows".
+            idx_real = _detect_index_rows(src) if kind == "Index" else None
             try:
                 # 1. Seam-bridge the coverage across UV gutters (fills near-seam
                 #    transparent pixels); plain copy when no UV-boundary map.
                 if mask_bg:
-                    if not _dilate_mask(src, dst, log, bg=mask_bg):
+                    if not _dilate_mask(src, dst, log, bg=mask_bg,
+                                        harden_seams=is_primary):
                         shutil.copy2(src, dst)
                 else:
                     shutil.copy2(src, dst)
@@ -3335,7 +3369,7 @@ def _copy_mask_option(exported_files: list, proteus_dir: str, option: str,
                 #    its R to real rows and harden its alpha so antialiased edges
                 #    can't read as wrong rows (G subrow gradient is preserved).
                 if kind == "Index":
-                    _snap_index_rows(dst, log)
+                    _snap_index_rows(dst, log, real=idx_real)
                 # 4. Stamp last so the earlier rewrites keep the dedup chunk.
                 _png_copy_stamped(dst, dst, label)
             except Exception as exc:
