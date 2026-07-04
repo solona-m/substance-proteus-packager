@@ -130,6 +130,10 @@ _MASK_HOLE_FILL_PX         =  8  # tiny unpainted holes fully enclosed by paint
                                   # (bake/rasterization noise, not real gaps)
                                   # this small get closed regardless of UV-seam
                                   # proximity
+_MASK_CONTENT_BLEED_PX     =  8  # extend garment RGB outward under the soft
+                                  # coverage edge so the antialiased silhouette
+                                  # reads garment colour (not the fabric/bg
+                                  # default) in the UV margins
 
 # texconv target format per texture type; None = keep lossless PNG.
 # Only diffuse tolerates lossy BC7. Normals use BC5 (the 2-channel normal
@@ -2908,6 +2912,7 @@ def _dilate_mask(src: str, dst: str, log=None, bg: tuple | None = None) -> bool:
         except ImportError:
             pass
 
+        harden = None   # seam-band pixels to force fully opaque (bg path only)
         if bg is not None:
             bg_pix, bw, bh = bg
             if bw > 0 and bh > 0:
@@ -2959,6 +2964,13 @@ def _dilate_mask(src: str, dst: str, log=None, bg: tuple | None = None) -> bool:
                         _, (iy, ix) = _edt(isl == 0, return_indices=True)
                         nearest_isl = isl[iy, ix]
                         to_fill &= painted_island[nearest_isl]
+                        # Coverage across a UV seam must be full, not feathered:
+                        # a painted pixel within the seam band renders at partial
+                        # opacity → a faint half-applied line at every island
+                        # boundary. Solidify the garment's own antialiased edge
+                        # inside the band (the silhouette edge, away from seams,
+                        # keeps its soft edge).
+                        harden = opaque & (ed <= R_INNER) & painted_island[nearest_isl]
                     else:
                         to_fill[:] = False
                 except ImportError:
@@ -2969,7 +2981,16 @@ def _dilate_mask(src: str, dst: str, log=None, bg: tuple | None = None) -> bool:
         to_fill |= hole_fill
 
         fy, fx = np.where(to_fill)
-        arr[fy, fx] = orig[sry[fy, fx], srx[fy, fx]]
+        arr[fy, fx, :3] = orig[sry[fy, fx], srx[fy, fx], :3]
+        if harden is not None:
+            # bg present → solidify coverage across UV seams: the bridged fills
+            # and the garment's feathered edge within the seam band become fully
+            # opaque, so both sides of every seam sample 100% coverage.
+            arr[fy, fx, 3] = 255
+            arr[harden, 3] = 255
+        else:
+            # No UV-boundary map: keep original behaviour (copy source alpha).
+            arr[fy, fx, 3] = orig[sry[fy, fx], srx[fy, fx], 3]
         _I.fromarray(arr).save(dst, "PNG")
         return True
 
@@ -3166,6 +3187,42 @@ def _dilate_mask(src: str, dst: str, log=None, bg: tuple | None = None) -> bool:
         return False
 
 
+def _bleed_content(path: str, radius: int = _MASK_CONTENT_BLEED_PX, log=None) -> bool:
+    """Extend a mask map's RGB (its content) outward from the fully-opaque
+    garment region into the surrounding pixels, **without changing alpha**.
+
+    A mask map's alpha is the garment silhouette, painted with a soft
+    (antialiased) edge. Where that soft edge crosses a UV-island boundary into
+    the margins, the RGB underneath has already ramped to the fabric/background
+    default — so Proteus applies the overlay at partial opacity reading that
+    default (e.g. a dark row-16 hairline around the neckline where the diffuse
+    has fallen off). Bleeding the garment colour/row/normal outward under the
+    edge makes the feathered silhouette read real garment content instead. This
+    is standard alpha-edge colour dilation; the alpha (coverage) is untouched,
+    so the silhouette shape is unchanged. Returns True on success."""
+    try:
+        import numpy as np
+        from PIL import Image
+        from scipy.ndimage import distance_transform_edt
+    except ImportError:
+        return False
+    try:
+        a = np.asarray(Image.open(path).convert("RGBA")).copy()
+        solid = a[:, :, 3] >= 250            # fully-covered garment interior
+        if not solid.any() or solid.all():
+            return False                     # nothing to bleed from / into
+        dist, (iy, ix) = distance_transform_edt(~solid, return_indices=True)
+        fill = (~solid) & (dist <= radius)
+        for c in range(3):                   # copy RGB from nearest solid; keep A
+            a[:, :, c] = np.where(fill, a[iy, ix, c], a[:, :, c])
+        Image.fromarray(a, "RGBA").save(path, "PNG")
+        return True
+    except Exception as exc:
+        if log:
+            log(f"  Warning: content bleed failed on {os.path.basename(path)} — {exc}")
+        return False
+
+
 def _snap_index_rows(path: str, log=None) -> bool:
     """Harden a Proteus index (_id) map so its R channel (the colorset row
     selector) holds only discrete real rows and its alpha is a hard mask.
@@ -3262,22 +3319,29 @@ def _copy_mask_option(exported_files: list, proteus_dir: str, option: str,
             dst = os.path.join(masks_dir, fname)
             label = f"Masks/{fname[:-4]}"
             try:
+                # 1. Seam-bridge the coverage across UV gutters (fills near-seam
+                #    transparent pixels); plain copy when no UV-boundary map.
                 if mask_bg:
                     if not _dilate_mask(src, dst, log, bg=mask_bg):
                         shutil.copy2(src, dst)
-                    _png_copy_stamped(dst, dst, label)
                 else:
-                    _png_copy_stamped(src, dst, label)
+                    shutil.copy2(src, dst)
+                # 2. Bleed garment content (RGB) outward under the soft coverage
+                #    edge so the antialiased silhouette reads garment colour in
+                #    the margins, not the fabric/background default (the row-16
+                #    edge hairline). Alpha/coverage shape is preserved.
+                _bleed_content(dst, log=log)
+                # 3. The index (_id) is a discrete colorset-row selector — snap
+                #    its R to real rows and harden its alpha so antialiased edges
+                #    can't read as wrong rows (G subrow gradient is preserved).
+                if kind == "Index":
+                    _snap_index_rows(dst, log)
+                # 4. Stamp last so the earlier rewrites keep the dedup chunk.
+                _png_copy_stamped(dst, dst, label)
             except Exception as exc:
                 if log:
                     log(f"  ERROR: mask '{option}' ({fname}) processing failed — {exc}")
                 _png_copy_stamped(src, dst, label)
-            # The index (_id) is a discrete colorset-row selector — snap its R to
-            # real rows and harden its alpha so antialiased edges can't read as
-            # wrong rows (the G subrow gradient is preserved). Re-stamp after,
-            # since the rewrite drops the dedup chunk.
-            if kind == "Index" and _snap_index_rows(dst, log):
-                _png_copy_stamped(dst, dst, label)
             # Alpha check must run on the PNG (reads the PNG header) before any
             # BC7 conversion below.
             if is_primary and log and not _png_has_alpha(dst):
