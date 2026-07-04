@@ -134,6 +134,10 @@ _MASK_CONTENT_BLEED_PX     =  8  # extend garment RGB outward under the soft
                                   # coverage edge so the antialiased silhouette
                                   # reads garment colour (not the fabric/bg
                                   # default) in the UV margins
+_MASK_SEAM_SRC_DEPTH_PX    =  4  # when filling across a UV seam, sample the
+                                  # source this far INTO solid paint (past the
+                                  # degraded antialiased edge pixels, which would
+                                  # themselves read as a seam)
 
 # texconv target format per texture type; None = keep lossless PNG.
 # Only diffuse tolerates lossy BC7. Normals use BC5 (the 2-channel normal
@@ -2914,6 +2918,7 @@ def _dilate_mask(src: str, dst: str, log=None, bg: tuple | None = None,
             pass
 
         harden = None   # seam-band pixels to force fully opaque (bg path only)
+        psrc_y = psrc_x = None   # perpendicular-across-seam source indices
         if bg is not None:
             bg_pix, bw, bh = bg
             if bw > 0 and bh > 0:
@@ -2927,6 +2932,40 @@ def _dilate_mask(src: str, dst: str, log=None, bg: tuple | None = None,
                 seam[:, 1:]  |= bg_a[:, :-1] != bg_a[:, 1:]
                 seam[:-1, :] |= bg_a[:-1, :] != bg_a[1:, :]
                 seam[1:, :]  |= bg_a[:-1, :] != bg_a[1:, :]
+
+                # Perpendicular-across-seam source: for each pixel find its
+                # nearest point ON the seam (its perpendicular foot), then take
+                # the paint nearest to that foot. A seam-fill pixel then copies
+                # straight across the seam at its own tangential position, so the
+                # extended band runs parallel (tangent) to the seam instead of
+                # grabbing paint from around a corner (which leaves stray marks).
+                try:
+                    _, (_syn, _sxn) = _edt(~seam, return_indices=True)
+                    # Sample the source a few px INTO the painted region, past
+                    # the antialiased boundary ramp (whose degraded pixels would
+                    # read as a seam). Define "interior" by eroding the *paint*
+                    # (alpha>0), NOT by opacity level: a sheer garment's body is
+                    # semi-transparent and only its dark trim is fully opaque, so
+                    # an alpha>=250 test would sample the black border and leak it
+                    # into the sheer area. Nearest interior to the seam foot ≈
+                    # straight in along the normal.
+                    core = seed
+                    try:
+                        from scipy.ndimage import binary_erosion as _ero
+                        _c = _ero(seed, iterations=_MASK_SEAM_SRC_DEPTH_PX)
+                        if _c.any():
+                            core = _c
+                    except ImportError:
+                        pass
+                    if core.any():
+                        _, (_cry, _crx) = _edt(~core, return_indices=True)
+                        psrc_y = _cry[_syn, _sxn]
+                        psrc_x = _crx[_syn, _sxn]
+                    else:
+                        psrc_y = sry[_syn, _sxn]
+                        psrc_x = srx[_syn, _sxn]
+                except (NameError, ImportError):
+                    pass
 
                 R_INNER = _MASK_DILATION_INNER_PX
                 INF_E = R_INNER + 1
@@ -2984,19 +3023,26 @@ def _dilate_mask(src: str, dst: str, log=None, bg: tuple | None = None,
                         log("  [dilation] scipy unavailable — skipping island-paint "
                             "guard (may bleed into unpainted islands)")
 
-        to_fill |= hole_fill
-
-        fy, fx = np.where(to_fill)
-        arr[fy, fx, :3] = orig[sry[fy, fx], srx[fy, fx], :3]
+        # Seam-band fills copy *across* the seam (perpendicular → tangent bands);
+        # tiny interior hole-fills copy from the actual nearest paint, since
+        # they're not seam-related and an across-seam source would be wrong.
+        usy, usx = (psrc_y, psrc_x) if psrc_y is not None else (sry, srx)
+        hole_only = hole_fill & ~to_fill
+        sfy, sfx = np.where(to_fill)
+        hfy, hfx = np.where(hole_only)
+        arr[sfy, sfx, :3] = orig[usy[sfy, sfx], usx[sfy, sfx], :3]
+        arr[hfy, hfx, :3] = orig[sry[hfy, hfx], srx[hfy, hfx], :3]
         if harden is not None:
             # bg present → solidify coverage across UV seams: the bridged fills
             # and the garment's feathered edge within the seam band become fully
             # opaque, so both sides of every seam sample 100% coverage.
-            arr[fy, fx, 3] = 255
+            arr[sfy, sfx, 3] = 255
+            arr[hfy, hfx, 3] = 255
             arr[harden, 3] = 255
         else:
             # No UV-boundary map: keep original behaviour (copy source alpha).
-            arr[fy, fx, 3] = orig[sry[fy, fx], srx[fy, fx], 3]
+            arr[sfy, sfx, 3] = orig[usy[sfy, sfx], usx[sfy, sfx], 3]
+            arr[hfy, hfx, 3] = orig[sry[hfy, hfx], srx[hfy, hfx], 3]
         _I.fromarray(arr).save(dst, "PNG")
         return True
 
