@@ -134,7 +134,7 @@ _MASK_CONTENT_BLEED_PX     =  8  # extend garment RGB outward under the soft
                                   # coverage edge so the antialiased silhouette
                                   # reads garment colour (not the fabric/bg
                                   # default) in the UV margins
-_MASK_SEAM_SRC_DEPTH_PX    =  4  # when filling across a UV seam, sample the
+_MASK_SEAM_SRC_DEPTH_PX    =  3  # when filling across a UV seam, sample the
                                   # source this far INTO solid paint (past the
                                   # degraded antialiased edge pixels, which would
                                   # themselves read as a seam)
@@ -2897,28 +2897,33 @@ def _dilate_mask(src: str, dst: str, log=None, bg: tuple | None = None,
 
         to_fill = (~opaque) & (dist <= R)
 
-        # Tiny unpainted holes fully enclosed by paint are bake/rasterization
-        # noise (sub-pixel coverage rounding), not real content or seam gaps —
-        # close them unconditionally, independent of UV-seam proximity. A
-        # direct SP export using general "diffusion" padding absorbs this
-        # same noise automatically; our seam-restricted fill otherwise leaves
-        # it untouched since it's not near a UV border.
+        # Unpainted regions fully ENCLOSED by paint are gaps to close — whether
+        # bake/rasterization noise or a thin seam line between two coverage
+        # pieces on the same geometry. An OPEN region (e.g. the crotch) is not an
+        # enclosed hole, so it is never touched here. Fill a hole only if it is
+        # THIN everywhere (its farthest point is <= _MASK_HOLE_FILL_PX from paint)
+        # — length doesn't matter, so a long hairline closes, but a genuine fat
+        # cut-out is left alone. This is independent of UV-seam proximity.
         hole_fill = np.zeros_like(opaque)
         try:
             from scipy.ndimage import (label as _hole_label,
-                                        binary_fill_holes as _fill_holes)
+                                        binary_fill_holes as _fill_holes,
+                                        maximum as _hole_max)
             interior_holes = _fill_holes(opaque) & ~opaque
             hole_lbl, n_holes = _hole_label(interior_holes, structure=np.ones((3, 3)))
             if n_holes:
-                hole_sizes = np.bincount(hole_lbl.ravel())
-                small_enough = hole_sizes <= _MASK_HOLE_FILL_PX
-                small_enough[0] = False
-                hole_fill = small_enough[hole_lbl] & (dist <= R)
+                hmax = _hole_max(dist, hole_lbl,
+                                 index=np.arange(1, n_holes + 1))
+                thin = np.concatenate([[False],
+                                       np.asarray(hmax) <= _MASK_HOLE_FILL_PX])
+                hole_fill = thin[hole_lbl]
         except ImportError:
             pass
 
         harden = None   # seam-band pixels to force fully opaque (bg path only)
         psrc_y = psrc_x = None   # perpendicular-across-seam source indices
+        across_ok = None   # where the across-seam sample lands in paint
+        margin = None      # bg "empty space between islands" (bg alpha>0)
         if bg is not None:
             bg_pix, bw, bh = bg
             if bw > 0 and bh > 0:
@@ -2926,6 +2931,7 @@ def _dilate_mask(src: str, dst: str, log=None, bg: tuple | None = None,
                 if (bw, bh) != (w, h):
                     bg_img = bg_img.resize((w, h), _I.NEAREST)
                 bg_a = np.asarray(bg_img)[:, :, 3] > 0
+                margin = bg_a          # empty space between UV islands
 
                 seam = np.zeros((h, w), dtype=bool)
                 seam[:, :-1] |= bg_a[:, :-1] != bg_a[:, 1:]
@@ -2941,29 +2947,23 @@ def _dilate_mask(src: str, dst: str, log=None, bg: tuple | None = None,
                 # grabbing paint from around a corner (which leaves stray marks).
                 try:
                     _, (_syn, _sxn) = _edt(~seam, return_indices=True)
-                    # Sample the source a few px INTO the painted region, past
-                    # the antialiased boundary ramp (whose degraded pixels would
-                    # read as a seam). Define "interior" by eroding the *paint*
-                    # (alpha>0), NOT by opacity level: a sheer garment's body is
-                    # semi-transparent and only its dark trim is fully opaque, so
-                    # an alpha>=250 test would sample the black border and leak it
-                    # into the sheer area. Nearest interior to the seam foot ≈
-                    # straight in along the normal.
-                    core = seed
-                    try:
-                        from scipy.ndimage import binary_erosion as _ero
-                        _c = _ero(seed, iterations=_MASK_SEAM_SRC_DEPTH_PX)
-                        if _c.any():
-                            core = _c
-                    except ImportError:
-                        pass
-                    if core.any():
-                        _, (_cry, _crx) = _edt(~core, return_indices=True)
-                        psrc_y = _cry[_syn, _sxn]
-                        psrc_x = _crx[_syn, _sxn]
-                    else:
-                        psrc_y = sry[_syn, _sxn]
-                        psrc_x = srx[_syn, _sxn]
+                    # Sample straight ACROSS the seam along the local normal, a
+                    # few px into the far side — so a gap reads the content at its
+                    # own tangential position (sheer stays sheer) instead of the
+                    # nearest paint, which grabs a tangentially-adjacent dark
+                    # border and leaks it into the sheer. The normal points from
+                    # each pixel to its nearest seam point; stepping past that foot
+                    # crosses onto the other island. Where that lands off-paint
+                    # (silhouette gaps), fall back to nearest paint.
+                    _ny = (_syn - np.arange(h)[:, None]).astype(np.float32)
+                    _nx = (_sxn - np.arange(w)[None, :]).astype(np.float32)
+                    _k = _MASK_SEAM_SRC_DEPTH_PX / np.maximum(np.hypot(_ny, _nx), 1e-6)
+                    _ty = np.clip((_syn + _ny * _k).round().astype(np.int32), 0, h - 1)
+                    _tx = np.clip((_sxn + _nx * _k).round().astype(np.int32), 0, w - 1)
+                    _ok = seed[_ty, _tx]
+                    across_ok = _ok
+                    psrc_y = np.where(_ok, _ty, sry)
+                    psrc_x = np.where(_ok, _tx, srx)
                 except (NameError, ImportError):
                     pass
 
@@ -2983,7 +2983,11 @@ def _dilate_mask(src: str, dst: str, log=None, bg: tuple | None = None,
                 for y in range(h-2, -1, -1):
                     c = ed[y+1] + 1
                     ed[y] = np.where(c < ed[y], c, ed[y])
-                to_fill &= ed <= R_INNER
+                # NB: the fill is no longer restricted to a thin seam band — the
+                # margin gate below (to_fill &= margin) already confines it to the
+                # empty space between islands, which is always safe to fill, so
+                # the whole gutter closes rather than leaving a line down its
+                # middle. `ed` is still used to scope the harden to seam edges.
 
                 # Don't bridge into a UV island that this option never painted
                 # at all (e.g. an unrelated accessory shell that merely
@@ -3023,6 +3027,13 @@ def _dilate_mask(src: str, dst: str, log=None, bg: tuple | None = None,
                         log("  [dilation] scipy unavailable — skipping island-paint "
                             "guard (may bleed into unpainted islands)")
 
+        # Extend coverage ONLY into the empty space between UV islands (the bg
+        # margin), never into island content (real geometry). This bridges seams
+        # — whose gutters are margin — without pushing garment onto skin or across
+        # a narrow same-geometry gap like the crotch (which is island content, so
+        # it's protected). The UV map is the ground truth for "seam vs not".
+        if margin is not None:
+            to_fill &= margin
         # Seam-band fills copy *across* the seam (perpendicular → tangent bands);
         # tiny interior hole-fills copy from the actual nearest paint, since
         # they're not seam-related and an across-seam source would be wrong.
@@ -3030,12 +3041,15 @@ def _dilate_mask(src: str, dst: str, log=None, bg: tuple | None = None,
         hole_only = hole_fill & ~to_fill
         sfy, sfx = np.where(to_fill)
         hfy, hfx = np.where(hole_only)
+        # RGB: seam fills from the perpendicular interior; holes from nearest.
         arr[sfy, sfx, :3] = orig[usy[sfy, sfx], usx[sfy, sfx], :3]
         arr[hfy, hfx, :3] = orig[sry[hfy, hfx], srx[hfy, hfx], :3]
         if harden is not None:
-            # bg present → solidify coverage across UV seams: the bridged fills
-            # and the garment's feathered edge within the seam band become fully
-            # opaque, so both sides of every seam sample 100% coverage.
+            # bg present → solidify coverage across UV seams: bridged fills and
+            # the garment's feathered edge within the seam band become fully
+            # opaque, so both sides of every seam sample full coverage. (Garment
+            # sheerness comes from the fabric, not this coverage mask, so 255 is
+            # the intended level.)
             arr[sfy, sfx, 3] = 255
             arr[hfy, hfx, 3] = 255
             arr[harden, 3] = 255
@@ -3260,12 +3274,16 @@ def _bleed_content(path: str, radius: int = _MASK_CONTENT_BLEED_PX, log=None) ->
         return False
     try:
         a = np.asarray(Image.open(path).convert("RGBA")).copy()
-        solid = a[:, :, 3] >= 250            # fully-covered garment interior
-        if not solid.any() or solid.all():
+        painted = a[:, :, 3] > 0             # ANY garment coverage (sheer or solid)
+        if not painted.any() or painted.all():
             return False                     # nothing to bleed from / into
-        dist, (iy, ix) = distance_transform_edt(~solid, return_indices=True)
-        fill = (~solid) & (dist <= radius)
-        for c in range(3):                   # copy RGB from nearest solid; keep A
+        # Fill ONLY the fully-transparent margin, from the nearest painted pixel.
+        # (Bleeding into every <250-alpha pixel would copy the opaque trim into a
+        # sheer body — α≈128 — and darken it. Sheer coverage is real content, not
+        # a margin to fill.) Alpha is untouched, so the silhouette is unchanged.
+        dist, (iy, ix) = distance_transform_edt(~painted, return_indices=True)
+        fill = (~painted) & (dist <= radius)
+        for c in range(3):                   # copy RGB from nearest paint; keep A
             a[:, :, c] = np.where(fill, a[iy, ix, c], a[:, :, c])
         Image.fromarray(a, "RGBA").save(path, "PNG")
         return True
