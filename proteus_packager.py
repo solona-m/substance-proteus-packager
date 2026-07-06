@@ -3289,10 +3289,13 @@ def _bleed_content(path: str, radius: int = _MASK_CONTENT_BLEED_PX, log=None) ->
 
 
 def _detect_index_rows(path: str):
-    """Return the set of real colorset rows (unique R values in fully-opaque
-    pixels) from a *clean* index map — call this on the original SP export,
-    before any dilation/hardening can turn antialiased edge values into solid
-    fake rows. Returns a numpy array, or None if it can't read the file."""
+    """Return the set of real colorset rows (unique R values) from a *clean*
+    index map — call this on the original SP export, before any dilation can
+    turn antialiased edge values into solid fake rows. Detect from the ERODED
+    fully-opaque region (flat interiors only): a row boundary is antialiased, so
+    its in-between R values (e.g. 191 between two rows) sit in a thin band that
+    erosion strips — otherwise they'd be mistaken for real rows and a stray
+    row-15 speck would survive the snap. Returns a numpy array, or None."""
     try:
         import numpy as np
         from PIL import Image
@@ -3300,7 +3303,15 @@ def _detect_index_rows(path: str):
         return None
     try:
         a = np.asarray(Image.open(path).convert("RGBA"))
-        real = np.unique(a[:, :, 0][a[:, :, 3] >= 250])
+        opaque = a[:, :, 3] >= 250
+        try:
+            from scipy.ndimage import binary_erosion
+            core = binary_erosion(opaque, iterations=2)
+            if core.any():
+                opaque = core          # flat interiors, sans antialiased edges
+        except ImportError:
+            pass
+        real = np.unique(a[:, :, 0][opaque])
         return real if real.size else None
     except Exception:
         return None
