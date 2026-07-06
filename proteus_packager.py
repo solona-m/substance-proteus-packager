@@ -2945,25 +2945,20 @@ def _dilate_mask(src: str, dst: str, log=None, bg: tuple | None = None,
                 # straight across the seam at its own tangential position, so the
                 # extended band runs parallel (tangent) to the seam instead of
                 # grabbing paint from around a corner (which leaves stray marks).
+                # Colour source: the nearest SOLID interior paint (coverage
+                # eroded by a few px so the antialiased edge is skipped). A margin
+                # pixel therefore reads a clean "good" pixel — dark-on-dark,
+                # white-on-white, sheer-on-sheer — the perpendicular-inward
+                # content at its own position, rather than a blended edge pixel or
+                # a tangentially-nearer feature (which produced white-on-black /
+                # grey-on-white streaks).
                 try:
-                    _, (_syn, _sxn) = _edt(~seam, return_indices=True)
-                    # Sample straight ACROSS the seam along the local normal, a
-                    # few px into the far side — so a gap reads the content at its
-                    # own tangential position (sheer stays sheer) instead of the
-                    # nearest paint, which grabs a tangentially-adjacent dark
-                    # border and leaks it into the sheer. The normal points from
-                    # each pixel to its nearest seam point; stepping past that foot
-                    # crosses onto the other island. Where that lands off-paint
-                    # (silhouette gaps), fall back to nearest paint.
-                    _ny = (_syn - np.arange(h)[:, None]).astype(np.float32)
-                    _nx = (_sxn - np.arange(w)[None, :]).astype(np.float32)
-                    _k = _MASK_SEAM_SRC_DEPTH_PX / np.maximum(np.hypot(_ny, _nx), 1e-6)
-                    _ty = np.clip((_syn + _ny * _k).round().astype(np.int32), 0, h - 1)
-                    _tx = np.clip((_sxn + _nx * _k).round().astype(np.int32), 0, w - 1)
-                    _ok = seed[_ty, _tx]
-                    across_ok = _ok
-                    psrc_y = np.where(_ok, _ty, sry)
-                    psrc_x = np.where(_ok, _tx, srx)
+                    from scipy.ndimage import binary_erosion as _ero
+                    _solid = _ero(seed, iterations=_MASK_SEAM_SRC_DEPTH_PX)
+                    if not _solid.any():
+                        _solid = seed
+                    _, (_soy, _sox) = _edt(~_solid, return_indices=True)
+                    psrc_y, psrc_x = _soy, _sox
                 except (NameError, ImportError):
                     pass
 
