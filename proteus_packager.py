@@ -120,6 +120,13 @@ _TALL_FEMALE_FACES_PATHS = "\n".join([
     "chara/human/c1001/obj/face/f0249/material/mt_c1001f0249_fac_a.mtrl",
 ])
 
+# ── TEMP TEST FLAG ─────────────────────────────────────────────────────────
+# When True: skip ALL of our mask post-processing (_dilate_mask, _bleed_content,
+# _snap_index_rows) and export masks with Substance's own "diffusion" padding
+# instead of "passthrough". Isolates whether seams come from our processing or
+# from Substance's raw output. Set back to False to restore normal behaviour.
+_DISABLE_MASK_POSTPROCESS  = True
+
 _DIFFUSE_DILATION_PX       = 16  # SP diffusion distance for color textures
 _MASK_DILATION_PX          =  8  # max paint-search radius for mask dilation
 _MASK_DILATION_INNER_PX    =  3  # max seam-proximity radius for mask dilation
@@ -1318,9 +1325,10 @@ class ProteusPackagerPlugin:
 
     def _do_sp_export(self, ts_names: list[str], output_dir: str,
                       preset_url: str = "", passthrough: bool = False) -> list[str]:
-        if passthrough:
+        if passthrough and not _DISABLE_MASK_POSTPROCESS:
             params = {"paddingAlgorithm": "passthrough"}
         else:
+            # Test flag on: masks also get Substance's diffusion dilation.
             params = {"paddingAlgorithm": "diffusion",
                       "dilationDistance": _DIFFUSE_DILATION_PX}
         # Optional resolution override (SP sizeLog2 = log2 of square size);
@@ -3422,26 +3430,31 @@ def _copy_mask_option(exported_files: list, proteus_dir: str, option: str,
             # would otherwise look like extra "rows".
             idx_real = _detect_index_rows(src) if kind == "Index" else None
             try:
-                # 1. Seam-bridge the coverage across UV gutters (fills near-seam
-                #    transparent pixels); plain copy when no UV-boundary map.
-                if mask_bg:
-                    if not _dilate_mask(src, dst, log, bg=mask_bg,
-                                        harden_seams=is_primary):
-                        shutil.copy2(src, dst)
+                if _DISABLE_MASK_POSTPROCESS:
+                    # TEST: no post-processing — copy Substance's raw (diffusion-
+                    # padded) output straight through, stamp only.
+                    _png_copy_stamped(src, dst, label)
                 else:
-                    shutil.copy2(src, dst)
-                # 2. Bleed garment content (RGB) outward under the soft coverage
-                #    edge so the antialiased silhouette reads garment colour in
-                #    the margins, not the fabric/background default (the row-16
-                #    edge hairline). Alpha/coverage shape is preserved.
-                _bleed_content(dst, log=log)
-                # 3. The index (_id) is a discrete colorset-row selector — snap
-                #    its R to real rows and harden its alpha so antialiased edges
-                #    can't read as wrong rows (G subrow gradient is preserved).
-                if kind == "Index":
-                    _snap_index_rows(dst, log, real=idx_real)
-                # 4. Stamp last so the earlier rewrites keep the dedup chunk.
-                _png_copy_stamped(dst, dst, label)
+                    # 1. Seam-bridge the coverage across UV gutters (fills near-seam
+                    #    transparent pixels); plain copy when no UV-boundary map.
+                    if mask_bg:
+                        if not _dilate_mask(src, dst, log, bg=mask_bg,
+                                            harden_seams=is_primary):
+                            shutil.copy2(src, dst)
+                    else:
+                        shutil.copy2(src, dst)
+                    # 2. Bleed garment content (RGB) outward under the soft coverage
+                    #    edge so the antialiased silhouette reads garment colour in
+                    #    the margins, not the fabric/background default (the row-16
+                    #    edge hairline). Alpha/coverage shape is preserved.
+                    _bleed_content(dst, log=log)
+                    # 3. The index (_id) is a discrete colorset-row selector — snap
+                    #    its R to real rows and harden its alpha so antialiased edges
+                    #    can't read as wrong rows (G subrow gradient is preserved).
+                    if kind == "Index":
+                        _snap_index_rows(dst, log, real=idx_real)
+                    # 4. Stamp last so the earlier rewrites keep the dedup chunk.
+                    _png_copy_stamped(dst, dst, label)
             except Exception as exc:
                 if log:
                     log(f"  ERROR: mask '{option}' ({fname}) processing failed — {exc}")
