@@ -203,6 +203,7 @@ def close_plugin():
 class ProteusPackagerPlugin:
     def __init__(self):
         self._widget = None
+        self._menu_filter = None
         self._author = ""
         self._output_dir = ""
         self._existing_pmp = ""
@@ -679,6 +680,29 @@ class ProteusPackagerPlugin:
                 return meta
         return ""
 
+    def _find_installed_penumbra_folder(self, mod_name: str) -> str:
+        """Locate an already-installed Penumbra mod folder for `mod_name`,
+        the same matching rules as `_resolve_colorset_meta` (exact name,
+        then case-insensitive). Returns '' if none is found — a scoped
+        update merges into an existing install, it never creates one."""
+        mod_name = (mod_name or "").strip()
+        if not mod_name:
+            return ""
+        penumbra_root = _read_penumbra_root_from_xivlauncher()
+        if not penumbra_root or not os.path.isdir(penumbra_root):
+            return ""
+        candidates = [mod_name]
+        try:
+            candidates += [d for d in os.listdir(penumbra_root)
+                           if d.lower() == mod_name.lower() and d != mod_name]
+        except OSError:
+            pass
+        for folder in candidates:
+            path = os.path.join(penumbra_root, folder)
+            if os.path.isdir(os.path.join(path, "Proteus")):
+                return path
+        return ""
+
     def _load_mat_preset(self):
         name = self._mat_preset_combo.currentText()
         if name in self._presets:
@@ -713,6 +737,11 @@ class ProteusPackagerPlugin:
             substance_painter.event.ProjectCreated,
         ):
             substance_painter.event.DISPATCHER.connect(event_type, self._on_project_opened)
+
+        self._menu_filter = _LayerContextMenuFilter(self._on_scoped_update, log=self._log)
+        app = QtWidgets.QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self._menu_filter)
 
     def _on_project_opened(self, _ev=None):
         self._refresh_export_presets(select=self._export_preset)
@@ -768,6 +797,18 @@ class ProteusPackagerPlugin:
             self._log("No project open.")
             return
         self._build_pmp()
+
+    def _on_scoped_update(self, group: str, option: str):
+        """Triggered from the Layers panel right-click menu: re-export just
+        this one group/option folder and merge it into whichever target is
+        configured — the 'Existing PMP' file if set, otherwise the installed
+        Penumbra mod folder when 'Install to Penumbra' is checked."""
+        self._read_ui_settings()
+        if not substance_painter.project.is_open():
+            self._log("No project open.")
+            return
+        self._log(f"Scoped update: {group}/{option}")
+        self._build_pmp(scope=(group, option))
 
     def _on_generate_previews_clicked(self):
         self._read_ui_settings()
@@ -863,13 +904,18 @@ class ProteusPackagerPlugin:
 
     # ── Core packaging ────────────────────────────────────────────────────────
 
-    def _build_pmp(self):
+    def _build_pmp(self, scope: tuple[str, str] | None = None):
         if not _HAS_LAYERSTACK:
             self._log("substance_painter.layerstack not available — update Substance Painter.")
             return
 
         if not self._export_preset:
             self._log("Export Preset is required. Enter your SP export preset name in the settings.")
+            return
+
+        if scope and not self._existing_pmp and not self._install_to_penumbra:
+            self._log("Scoped update requires either an 'Existing PMP' path or "
+                      "'Install to Penumbra' to be set in the dock.")
             return
 
         # Resolve file:/// URIs to resource:// by importing as a session resource
@@ -892,35 +938,57 @@ class ProteusPackagerPlugin:
                       "Add a top-level group folder (group) with sub-folders (options).")
             return
 
+        if scope:
+            sg, so = scope
+            if sg not in structure or so not in structure[sg]:
+                self._log(f"Scoped update target '{sg}/{so}' not found in the current layer stack.")
+                return
+            structure = {sg: [so]}
+
         self._log("Groups: " + ", ".join(
             f"{g}({', '.join(opts)})" for g, opts in structure.items()
         ))
 
         # 2. Build temp directories
         merge_path = self._existing_pmp
-        merge = bool(merge_path)
-        if merge and not (merge_path.lower().endswith(".pmp")
-                          and os.path.isfile(merge_path)):
+        # A scoped update with no "Existing PMP" but "Install to Penumbra"
+        # checked merges straight into the already-installed mod folder —
+        # updating one option shouldn't require a full rebuild + resync of
+        # every other option.
+        folder_target = None
+        if scope and not merge_path and self._install_to_penumbra:
+            folder_target = self._find_installed_penumbra_folder(mod_name)
+            if not folder_target:
+                self._log(f"Scoped update: no installed Penumbra mod folder "
+                          f"found for '{mod_name}'.")
+                return
+
+        merge = bool(merge_path) or bool(folder_target)
+        if merge_path and not (merge_path.lower().endswith(".pmp")
+                                and os.path.isfile(merge_path)):
             self._log(f"Existing PMP not found or not a .pmp file: {merge_path}")
             return
-        if merge and self._install_to_penumbra:
+        if merge_path and self._install_to_penumbra:
             self._log("Existing PMP is set — ignoring 'Install to Penumbra' and "
                       "updating the pack in place.")
 
         tmpdir = tempfile.mkdtemp(prefix="proteus_pmp_")
         export_root = os.path.join(tmpdir, "_exports")  # intermediate SP exports
-        pmp_root = os.path.join(tmpdir, "_pmp")         # final .pmp content
+        # Merging straight into an installed mod folder writes there directly
+        # (no zip round-trip); otherwise use a temp "_pmp" dir as usual.
+        pmp_root = folder_target or os.path.join(tmpdir, "_pmp")
         proteus_dir = os.path.join(pmp_root, "Proteus")
         os.makedirs(export_root)
 
         if merge:
-            os.makedirs(pmp_root)
-            try:
-                shutil.unpack_archive(merge_path, pmp_root, format="zip")
-            except Exception as exc:
-                self._log(f"Failed to open existing PMP: {exc}")
-                shutil.rmtree(tmpdir, ignore_errors=True)
-                return
+            if not folder_target:
+                os.makedirs(pmp_root)
+                try:
+                    shutil.unpack_archive(merge_path, pmp_root, format="zip")
+                except Exception as exc:
+                    self._log(f"Failed to open existing PMP: {exc}")
+                    shutil.rmtree(tmpdir, ignore_errors=True)
+                    return
             os.makedirs(proteus_dir, exist_ok=True)
             meta_path = os.path.join(pmp_root, "meta.json")
             if os.path.isfile(meta_path):
@@ -1225,15 +1293,22 @@ class ProteusPackagerPlugin:
                 _ensure_default_mod_has_content(
                     os.path.join(pmp_root, "default_mod.json"))
 
-                # Zip and atomically overwrite the source .pmp in place
-                archive = shutil.make_archive(
-                    os.path.join(tmpdir, "_merged"), "zip", pmp_root)
-                tmp_dest = merge_path + ".tmp"
-                if os.path.exists(tmp_dest):
-                    os.remove(tmp_dest)
-                shutil.move(archive, tmp_dest)
-                os.replace(tmp_dest, merge_path)
-                self._log(f"Done (merged in place): {merge_path}")
+                if folder_target:
+                    # Already writing directly into the live install — no
+                    # zip round-trip needed, just tell Penumbra to reload it.
+                    self._log(f"Done (updated installed mod in place): {folder_target}")
+                    if _reload_penumbra_mod(folder_target, name=mod_name, log=self._log):
+                        self._log(f"Reloaded in Penumbra: {mod_name}")
+                else:
+                    # Zip and atomically overwrite the source .pmp in place
+                    archive = shutil.make_archive(
+                        os.path.join(tmpdir, "_merged"), "zip", pmp_root)
+                    tmp_dest = merge_path + ".tmp"
+                    if os.path.exists(tmp_dest):
+                        os.remove(tmp_dest)
+                    shutil.move(archive, tmp_dest)
+                    os.replace(tmp_dest, merge_path)
+                    self._log(f"Done (merged in place): {merge_path}")
             else:
                 # Proteus/metadata.json
                 _write_json(os.path.join(proteus_dir, "metadata.json"), {
@@ -1386,6 +1461,11 @@ class ProteusPackagerPlugin:
             substance_painter.event.ProjectCreated,
         ):
             substance_painter.event.DISPATCHER.disconnect(event_type, self._on_project_opened)
+        if getattr(self, "_menu_filter", None) is not None:
+            app = QtWidgets.QApplication.instance()
+            if app is not None:
+                app.removeEventFilter(self._menu_filter)
+            self._menu_filter = None
         if self._widget:
             substance_painter.ui.delete_ui_element(self._widget)
             self._widget = None
@@ -1699,6 +1779,56 @@ def _set_viewport_3d_only(log=None):
         log("  [preview] No 3D-only layout action found — switch manually if 2D is visible.")
 
 
+# ── Layers-panel right-click "scoped update" hook ─────────────────────────────
+#
+# Substance Painter's Python API has no public way to add items to the Layers
+# panel's context menu, so this hooks the Qt event loop directly: it watches
+# for any QMenu being shown, and if that menu looks like the layer-stack
+# context menu (has the usual Rename/Delete/Duplicate actions) and the current
+# selection resolves to a known group/option folder, it appends an extra
+# action. Entirely best-effort — if Painter's internals change and the menu
+# is no longer recognised, this just silently stops adding the extra item.
+_LAYER_MENU_HINTS = ("rename", "delete", "duplicate", "merge down", "clear")
+
+
+class _LayerContextMenuFilter(QtCore.QObject):
+    def __init__(self, on_update, log=None):
+        super().__init__()
+        self._on_update = on_update
+        self._log = log or (lambda *a, **k: None)
+
+    def eventFilter(self, obj, event):
+        try:
+            if event.type() == QtCore.QEvent.Show and isinstance(obj, QtWidgets.QMenu):
+                self._maybe_augment(obj)
+        except Exception:
+            pass
+        return False
+
+    def _maybe_augment(self, menu):
+        if getattr(menu, "_proteus_augmented", False):
+            return
+        texts = [(a.text() or "").replace("&", "").strip().lower()
+                 for a in menu.actions()]
+        hinted = any(hint in t for t in texts for hint in _LAYER_MENU_HINTS)
+        if not hinted:
+            return  # not the layer-stack context menu — the common case
+        found = _resolve_group_option_for_menu()
+        if not found:
+            # It IS the layer-stack menu, but we couldn't map the click to a
+            # known group/option folder — dump what the layerstack selection
+            # API actually returns, since the method name/signature has been
+            # guessed at rather than confirmed against this Painter build.
+            self._log("[Proteus] Layer-stack menu detected but couldn't resolve "
+                      "a group/option folder.\n" + _debug_describe_selection_api())
+            return
+        group, option = found
+        menu._proteus_augmented = True
+        menu.addSeparator()
+        act = menu.addAction(f"Proteus: Update '{option}' in mod")
+        act.triggered.connect(lambda: self._on_update(group, option))
+
+
 def _save_visibility(ts_node_map: dict) -> dict:
     """Save visibility only for the nodes _set_visibility_for_option actually
     mutates: top-level nodes, their direct group children (options), and the
@@ -1794,6 +1924,108 @@ def _node_children(node) -> list:
         except Exception:
             continue
     return []
+
+
+def _node_parent(node):
+    for getter in ("get_parent", "parent", "parent_node"):
+        try:
+            val = getattr(node, getter)
+            result = val() if callable(val) else val
+            if result is not None:
+                return result
+        except Exception:
+            continue
+    return None
+
+
+def _get_selected_nodes(stack) -> list:
+    """Read the Layers panel's current selection for `stack`."""
+    try:
+        return list(_ls.get_selected_nodes(stack))
+    except Exception:
+        return []
+
+
+def _resolve_group_option_for_node(node, structure: dict) -> tuple[str, str] | None:
+    """Walk up from `node` (the Layers-panel selection) by NAME to find which
+    (group, option) pair — as discovered by `_discover_structure` — it lives
+    inside. Matches by name rather than node identity: Painter's API returns
+    a fresh wrapper object for the same underlying node on every call, so an
+    `is` comparison against a node captured earlier never succeeds. Returns
+    None for anything outside a known option folder (a bare layer with no
+    group/option hierarchy, the group folder itself with no option selected,
+    empty space, etc.)."""
+    cur = node
+    hops = 0
+    while cur is not None and hops < 32:
+        name = _node_name(cur)
+        parent = _node_parent(cur)
+        parent_name = _node_name(parent) if parent is not None else None
+        if name and parent_name and parent_name in structure and name in structure[parent_name]:
+            return parent_name, name
+        cur = parent
+        hops += 1
+    return None
+
+
+def _debug_describe_selection_api() -> str:
+    """One-off diagnostic: what does substance_painter.layerstack actually
+    expose for reading the current selection, and what does it return right
+    now? _get_selected_nodes's method names were guessed rather than
+    confirmed against this Painter build."""
+    lines = []
+    select_attrs = sorted(a for a in dir(_ls) if "select" in a.lower())
+    lines.append(f"  layerstack attrs containing 'select': {select_attrs}")
+    try:
+        all_ts = list(substance_painter.textureset.all_texture_sets())
+    except Exception as exc:
+        lines.append(f"  all_texture_sets() raised: {exc!r}")
+        return "\n".join(lines)
+    for ts in all_ts:
+        try:
+            stack = ts.get_stack()
+        except Exception as exc:
+            lines.append(f"  {ts.name()}: get_stack() raised: {exc!r}")
+            continue
+        for name in ("get_selected_nodes", "selected_nodes"):
+            fn = getattr(_ls, name, None)
+            if fn is None:
+                lines.append(f"  {ts.name()}: {name} not found on _ls")
+                continue
+            for args in ((stack,), ()):
+                try:
+                    result = list(fn(*args))
+                    names = [_node_name(n) for n in result]
+                    lines.append(f"  {ts.name()}: {name}{args!r} -> {names}")
+                except Exception as exc:
+                    lines.append(f"  {ts.name()}: {name}{args!r} raised: {exc!r}")
+    return "\n".join(lines)
+
+
+def _resolve_group_option_for_menu() -> tuple[str, str] | None:
+    """Resolve the folder the right-clicked context menu applies to, as a
+    (group, option) pair validated against the live layer-stack structure,
+    using Painter's layerstack selected-node API."""
+    if not _HAS_LAYERSTACK:
+        return None
+    try:
+        all_ts = list(substance_painter.textureset.all_texture_sets())
+    except Exception:
+        return None
+    structure, _ts_node_map, _colorset_layers = _discover_structure(all_ts)
+    if not structure:
+        return None
+
+    for ts in all_ts:
+        try:
+            selected = _get_selected_nodes(ts.get_stack())
+        except Exception:
+            continue
+        for node in selected:
+            found = _resolve_group_option_for_node(node, structure)
+            if found:
+                return found
+    return None
 
 
 # ── Colorset sub-folder helpers ───────────────────────────────────────────────
