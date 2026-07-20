@@ -26,6 +26,7 @@ import struct
 import tempfile
 import threading
 import time
+import uuid
 import zlib
 import configparser
 from pathlib import Path
@@ -1064,9 +1065,9 @@ class ProteusPackagerPlugin:
             # Merge-mode: load existing Proteus/Penumbra content to append to
             proteus_meta = None
             pg_by_name: dict = {}            # group name -> Proteus OptionGroup
-            grp_files: dict = {}             # group name -> [json path, data]
-            touched_group_files: dict = {}   # json path -> data to rewrite
-            max_idx = 0
+            pmp_meta: dict = {}              # the pack's root meta.json (v4)
+            grp_by_name: dict = {}           # group name -> Penumbra group dict
+            superseded: list = []            # v3 files to delete after the write
             if merge:
                 pm_path = os.path.join(proteus_dir, "metadata.json")
                 if os.path.isfile(pm_path):
@@ -1081,18 +1082,11 @@ class ProteusPackagerPlugin:
                 proteus_meta.setdefault("OptionGroups", [])
                 for og in proteus_meta["OptionGroups"]:
                     pg_by_name[og.get("PenumbraGroupName")] = og
-                for gp in sorted(Path(pmp_root).glob("group_*.json")):
-                    try:
-                        with open(gp, encoding="utf-8") as f:
-                            gdata = json.load(f)
-                    except Exception:
-                        continue
-                    m = re.match(r"group_(\d+)_", gp.name)
-                    if m:
-                        max_idx = max(max_idx, int(m.group(1)))
+                pmp_meta, superseded = _load_meta_json(pmp_root, mod_name, author)
+                for gdata in pmp_meta["Groups"]:
                     gname = gdata.get("Name")
                     if gname is not None:
-                        grp_files[gname] = [str(gp), gdata]
+                        grp_by_name[gname] = gdata
 
             for group in groups_order:
                 # A "Masks" group is a Penumbra-only multi-select group: it is
@@ -1109,19 +1103,14 @@ class ProteusPackagerPlugin:
                             pg_by_name[group] = og
                         og.setdefault("Options", [])
 
-                    if group in grp_files:
-                        gpath, gdata = grp_files[group]
-                    else:
-                        max_idx += 1
-                        safe = re.sub(r"[^\w]", "_", group).lower()
-                        gpath = os.path.join(pmp_root, f"group_{max_idx:03d}_{safe}.json")
-                        gdata = {"Version": 0, "Name": group, "Description": "",
-                                 "Image": "", "Page": 0, "Priority": 0,
-                                 "Type": gt, "DefaultSettings": 0,
-                                 "Options": []}
-                        grp_files[group] = [gpath, gdata]
+                    gdata = grp_by_name.get(group)
+                    if gdata is None:
+                        # New group: append, so it lands last in priority order
+                        # (Groups array index = the old group_NNN number).
+                        gdata = _new_penumbra_group(group, gt)
+                        pmp_meta["Groups"].append(gdata)
+                        grp_by_name[group] = gdata
                     gdata.setdefault("Options", [])
-                    touched_group_files[gpath] = gdata
 
                     proteus_opts = og["Options"] if og is not None else None
                     penumbra_opts = gdata["Options"]
@@ -1279,19 +1268,16 @@ class ProteusPackagerPlugin:
                 self._log(f"[timing] mask_join: {time.time()-_t0:.2f}s")
 
             if merge:
-                # Update the Proteus sidecar + only the touched group files;
-                # preserve the pack's existing meta.json / default_mod.json.
+                # Update the Proteus sidecar + the pack's single meta.json. The
+                # groups were mutated in place inside pmp_meta, and every key we
+                # didn't touch (Identifier, ModTags, Image…) is preserved by
+                # having loaded and rewritten the whole document.
                 _write_json(os.path.join(proteus_dir, "metadata.json"), proteus_meta)
-                for gpath, gdata in touched_group_files.items():
-                    _write_json(gpath, gdata)
-                if not os.path.isfile(os.path.join(pmp_root, "meta.json")):
-                    _write_json(os.path.join(pmp_root, "meta.json"), {
-                        "FileVersion": 3, "Name": mod_name, "Author": author,
-                        "Description": "", "Version": "1.0", "Website": "",
-                        "ModTags": [],
-                    })
-                _ensure_default_mod_has_content(
-                    os.path.join(pmp_root, "default_mod.json"))
+                _ensure_default_data_has_content(pmp_meta)
+                _write_json(os.path.join(pmp_root, "meta.json"), pmp_meta)
+                # Only now is it safe to drop the v3 files we folded in: until
+                # the write above landed they were the only copy of the groups.
+                _clean_legacy_files(superseded, self._log)
 
                 if folder_target:
                     # Already writing directly into the live install — no
@@ -1318,33 +1304,37 @@ class ProteusPackagerPlugin:
                     "OptionGroups": option_groups_meta,
                 })
 
-                # meta.json
-                _write_json(os.path.join(pmp_root, "meta.json"), {
-                    "FileVersion": 3, "Name": mod_name, "Author": author,
-                    "Description": "", "Version": "1.0", "Website": "", "ModTags": [],
-                })
-
-                # default_mod.json
-                _write_json(os.path.join(pmp_root, "default_mod.json"),
-                            _default_mod_with_dummy())
-
-                # group_NNN_{name}.json
-                for idx, group in enumerate(groups_order, start=1):
+                # meta.json — one document carrying the default data and every
+                # group, in groups_order (array index = priority, lower first).
+                # A non-merge export rebuilds the groups from scratch, but the
+                # Identifier must survive if a pack is already installed here:
+                # Penumbra keys the mod by it, so a fresh one would detach the
+                # user's saved settings and read as an unrelated mod.
+                pmp_meta = _new_meta_json(
+                    mod_name, author,
+                    identifier=_existing_identifier(pmp_root))
+                for group in groups_order:
                     is_masks = _is_masks_group(group)
                     gt = "Multi" if is_masks else group_type
                     base_opts = [
-                        {"Name": o, "Description": "",
+                        {"Id": str(uuid.uuid4()), "Name": o, "Description": "",
                          "Image": option_images.get((group, o), ""),
                          "Files": {}, "FileSwaps": {}, "Manipulations": []}
                         for o in structure[group]]
+                    gdata = _new_penumbra_group(group, gt)
                     # Masks are always multi-select with no "None" option.
-                    opts = base_opts if is_masks else [_none_penumbra_option()] + base_opts
-                    safe = re.sub(r"[^\w]", "_", group).lower()
-                    _write_json(os.path.join(pmp_root, f"group_{idx:03d}_{safe}.json"), {
-                        "Version": 0, "Name": group, "Description": "", "Image": "",
-                        "Page": 0, "Priority": 0, "Type": gt,
-                        "DefaultSettings": 0, "Options": opts,
-                    })
+                    gdata["Options"] = (base_opts if is_masks
+                                        else [_none_penumbra_option()] + base_opts)
+                    pmp_meta["Groups"].append(gdata)
+                _write_json(os.path.join(pmp_root, "meta.json"), pmp_meta)
+                # Drop any v3 files left over from an older export into this
+                # same folder; Penumbra ignores them, but a stale group_*.json
+                # beside a live meta.json reads like current state.
+                stale = [str(p) for p in Path(pmp_root).glob("group_*.json")]
+                dm = os.path.join(pmp_root, "default_mod.json")
+                if os.path.isfile(dm):
+                    stale.append(dm)
+                _clean_legacy_files(stale, self._log)
 
                 if self._install_to_penumbra:
                     penumbra_root = _read_penumbra_root_from_xivlauncher(self._log)
@@ -2794,18 +2784,22 @@ def _split_csv(text: str) -> list[str]:
 
 def _upsert_option(options: list, entry: dict) -> bool:
     """Insert entry into options, or replace an existing entry with the same
-    Name. Returns True if an existing option was replaced."""
+    Name. Returns True if an existing option was replaced. The existing Id is
+    carried over — Penumbra keys the user's saved selections by it, so minting
+    a new one on every re-export would silently reset their choices."""
     for i, o in enumerate(options):
         if o.get("Name") == entry["Name"]:
+            entry.setdefault("Id", o.get("Id") or str(uuid.uuid4()))
             options[i] = entry
             return True
+    entry.setdefault("Id", str(uuid.uuid4()))
     options.append(entry)
     return False
 
 
 def _none_penumbra_option() -> dict:
-    return {"Name": "None", "Description": "", "Image": "", "Files": {},
-            "FileSwaps": {}, "Manipulations": []}
+    return {"Id": str(uuid.uuid4()), "Name": "None", "Description": "",
+            "Image": "", "Files": {}, "FileSwaps": {}, "Manipulations": []}
 
 
 # Penumbra treats a mod with no Files / Swaps / Manipulations across the
@@ -2818,29 +2812,143 @@ _DUMMY_SWAP_PATH = (
     "chara/monster/m8030/obj/body/b0001/material/v0001/mt_m8030b0001_a.mtrl"
 )
 
+# Penumbra's on-disk mod format. Since FileVersion 4 the whole layout lives in
+# one root meta.json: option groups moved out of group_NNN_name.json files into
+# a "Groups" array (order = array index), and default_mod.json became the
+# "DefaultData" object. Older packs are migrated on load, see _load_meta_json.
+_META_FILE_VERSION = 4
 
-def _default_mod_with_dummy() -> dict:
+
+def _default_data_with_dummy() -> dict:
     return {"Files": {},
-            "Swaps": {_DUMMY_SWAP_PATH: _DUMMY_SWAP_PATH},
+            "FileSwaps": {_DUMMY_SWAP_PATH: _DUMMY_SWAP_PATH},
             "Manipulations": []}
 
 
-def _ensure_default_mod_has_content(path: str) -> None:
-    """Guarantee default_mod.json registers as a real change so Penumbra does
-    not treat the pack as empty. Writes the no-op dummy swap when the file is
-    missing or has no Files/Swaps/Manipulations; leaves it untouched when it
-    already carries real content (so merges don't clobber real redirects)."""
-    data = None
+def _existing_identifier(pmp_root: str):
+    """The Identifier of a pack already installed at pmp_root, or None. Penumbra
+    keys the mod by it, so it has to outlive a rebuild of the pack's contents."""
+    try:
+        with open(os.path.join(pmp_root, "meta.json"), encoding="utf-8") as f:
+            meta = json.load(f)
+        if isinstance(meta, dict):
+            ident = meta.get("Identifier")
+            return ident if isinstance(ident, str) and ident else None
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _new_meta_json(mod_name: str, author: str, identifier: str = None) -> dict:
+    return {
+        "FileVersion": _META_FILE_VERSION,
+        "Identifier": identifier or str(uuid.uuid4()),
+        "Name": mod_name, "Author": author, "Description": "",
+        "Version": "1.0", "Website": "", "ModTags": [],
+        "DefaultData": _default_data_with_dummy(),
+        "Groups": [],
+    }
+
+
+def _new_penumbra_group(name: str, group_type: str) -> dict:
+    return {"Type": group_type, "Id": str(uuid.uuid4()), "Name": name,
+            "Description": "", "Image": "", "Page": 0,
+            "DefaultSettings": 0, "Options": []}
+
+
+def _ensure_default_data_has_content(meta: dict) -> None:
+    """Guarantee DefaultData registers as a real change so Penumbra does not
+    treat the pack as empty. Installs the no-op dummy swap when it is missing
+    or empty; leaves it untouched when it already carries real content (so
+    merges don't clobber real redirects)."""
+    dd = meta.get("DefaultData")
+    if isinstance(dd, dict) and (dd.get("Files") or dd.get("FileSwaps")
+                                 or dd.get("Manipulations")):
+        return
+    meta["DefaultData"] = _default_data_with_dummy()
+
+
+def _load_meta_json(pmp_root: str, mod_name: str, author: str) -> tuple[dict, list]:
+    """Read the pack's root meta.json as FileVersion 4, folding a v3 layout
+    (separate group_*.json files + default_mod.json) into it so merge mode only
+    ever deals with one shape.
+
+    Returns (meta, superseded_paths). The legacy files are NOT deleted here —
+    they are the only copy of the data until the merged meta.json is safely on
+    disk, and a failure anywhere in the export between load and write would
+    otherwise leave the pack with its groups gone and nothing rewritten. Pass
+    the returned paths to _clean_legacy_files once the write succeeds."""
+    path = os.path.join(pmp_root, "meta.json")
+    superseded: list = []
+    meta = None
     if os.path.isfile(path):
         try:
             with open(path, encoding="utf-8") as f:
-                data = json.load(f)
+                meta = json.load(f)
         except Exception:
-            data = None
-    if isinstance(data, dict) and (data.get("Files") or data.get("Swaps")
-                                   or data.get("Manipulations")):
-        return
-    _write_json(path, _default_mod_with_dummy())
+            meta = None
+    if not isinstance(meta, dict):
+        return _new_meta_json(mod_name, author), superseded
+
+    meta.setdefault("Identifier", str(uuid.uuid4()))
+    meta.setdefault("Name", mod_name)
+    meta.setdefault("Author", author)
+
+    if not isinstance(meta.get("Groups"), list):
+        # v3 → v4: fold the group files in, sorted by their filename number,
+        # which is exactly the ordering the array index now carries.
+        groups = []
+        legacy = sorted(Path(pmp_root).glob("group_*.json"),
+                        key=lambda p: (int(m.group(1))
+                                       if (m := re.match(r"group_(\d+)_", p.name))
+                                       else 1 << 30, p.name))
+        for gp in legacy:
+            try:
+                with open(gp, encoding="utf-8") as f:
+                    gdata = json.load(f)
+            except Exception:
+                continue
+            if not isinstance(gdata, dict) or not gdata.get("Name"):
+                continue
+            gdata.pop("Version", None)
+            gdata.pop("Priority", None)   # ordering is the array index now
+            gdata.setdefault("Id", str(uuid.uuid4()))
+            for o in gdata.get("Options") or []:
+                o.setdefault("Id", str(uuid.uuid4()))
+            groups.append(gdata)
+            superseded.append(str(gp))
+        meta["Groups"] = groups
+
+    if "DefaultData" not in meta:
+        dm_path = os.path.join(pmp_root, "default_mod.json")
+        dd = None
+        if os.path.isfile(dm_path):
+            try:
+                with open(dm_path, encoding="utf-8") as f:
+                    dm = json.load(f)
+                if isinstance(dm, dict):
+                    # v3 called it "Swaps"; v4 calls it "FileSwaps".
+                    dd = {"Files": dm.get("Files") or {},
+                          "FileSwaps": dm.get("FileSwaps") or dm.get("Swaps") or {},
+                          "Manipulations": dm.get("Manipulations") or []}
+            except Exception:
+                dd = None
+            superseded.append(dm_path)
+        meta["DefaultData"] = dd or _default_data_with_dummy()
+
+    meta["FileVersion"] = _META_FILE_VERSION
+    return meta, superseded
+
+
+def _clean_legacy_files(paths: list, log=None) -> None:
+    """Delete the v3 files a migration has superseded. Call only after the
+    replacement meta.json is on disk — a stale copy reads like live state."""
+    for p in paths:
+        try:
+            os.remove(p)
+        except OSError as e:
+            if log:
+                log(f"  Could not remove superseded {os.path.basename(p)}: {e}")
 
 
 _FS_UNSAFE = re.compile(r'[<>:"/\\|?*]+')
@@ -3823,6 +3931,26 @@ def _to_bc7_dds(png_path: str, texconv: str, fmt: str = "BC7_UNORM",
     return dds_path
 
 
-def _write_json(path: str, data):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+def _write_json(path: str, data, retries: int = 5):
+    """Write JSON atomically: full contents to a temp sibling, then replace.
+    A torn write would be unrecoverable now that meta.json carries the entire
+    mod layout, and Penumbra's file watcher can hold the target open right
+    after a reload — hence the backoff retry around the replace."""
+    text = json.dumps(data, indent=2, ensure_ascii=False)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    for attempt in range(retries):
+        try:
+            os.replace(tmp, path)
+            return
+        except OSError:
+            if attempt == retries - 1:
+                try:
+                    os.remove(tmp)   # don't litter the mod folder
+                except OSError:
+                    pass
+                raise
+            time.sleep(0.1 * (2 ** attempt))
