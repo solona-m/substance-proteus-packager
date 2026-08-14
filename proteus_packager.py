@@ -1050,17 +1050,21 @@ class ProteusPackagerPlugin:
                     self._log("  BC7: texconv unavailable — falling back to PNG "
                               "output for this export")
 
-            colorset_map: dict = {}
+            # The pack's previous Proteus/metadata.json, when one can be found:
+            # the source of both reused colorsets and the editor-authored
+            # settings a rebuild has to carry forward (see _carry_unowned).
+            prior: dict = {"top": {}, "options": {}}
             # Manual override wins; otherwise re-detect fresh for this project
             # so a stale auto-filled path can never bleed across projects.
             colorset_src = (self._colorset_meta if self._colorset_meta_manual
                             else self._resolve_colorset_meta())
             if colorset_src:
                 if os.path.isfile(colorset_src):
-                    colorset_map = _load_colorset_map(colorset_src, log=self._log)
+                    prior = _load_prior_metadata(colorset_src, log=self._log)
                     self._log(f"Loaded colorsets from {colorset_src}")
                 else:
                     self._log(f"Colorset metadata not found: {colorset_src}")
+            prior_options = prior["options"]
 
             # Merge-mode: load existing Proteus/Penumbra content to append to
             proteus_meta = None
@@ -1219,8 +1223,14 @@ class ProteusPackagerPlugin:
                         overlay[tex_type] = f"{rel_subdir}/{fname}"
                         self._log(f"  {tex_type}: {rel_subdir}/{fname}")
 
-                    color_rows = (colorset_map.get((group, option))
-                                  or colorset_map.get((None, option)))
+                    # Rows and settings resolve independently: an option that
+                    # matches by group but carries no colorset still falls
+                    # through to a same-named option elsewhere for its rows.
+                    prior_exact = prior_options.get((group, option))
+                    prior_named = prior_options.get((None, option))
+                    prior_opt = prior_exact or prior_named or {}
+                    color_rows = ((prior_exact or {}).get("ColorTableRows")
+                                  or (prior_named or {}).get("ColorTableRows"))
                     if color_rows is not None and self._colorset_meta:
                         self._log(f"  Colorset reused for '{option}'")
                     if color_rows is None:
@@ -1238,6 +1248,22 @@ class ProteusPackagerPlugin:
                         "Overlays": [overlay],
                         "ColorTableRows": color_rows,
                     }
+                    # Everything else this option carried — the render layer
+                    # and shader, the scroll effect, the skin-tone mask — was
+                    # set in the /proteus editor and survives the rebuild. On
+                    # a merge the document being rewritten is the live copy;
+                    # otherwise fall back to the installed mod's metadata.
+                    carry_src = None
+                    if merge:
+                        carry_src = next((o for o in proteus_opts
+                                          if o.get("Name") == final_name), None)
+                    if carry_src is None:
+                        carry_src = prior_opt
+                    n = _carry_option_settings(pro_entry, carry_src)
+                    if n:
+                        self._log(f"  Carried {n} editor setting(s) forward "
+                                  f"for '{final_name}'")
+
                     image_rel = _maybe_copy_preview_into_pack(
                         self._resolve_output_dir(), mod_name,
                         group, final_name, pmp_root)
@@ -1297,12 +1323,20 @@ class ProteusPackagerPlugin:
                     self._log(f"Done (merged in place): {merge_path}")
             else:
                 # Proteus/metadata.json
-                _write_json(os.path.join(proteus_dir, "metadata.json"), {
+                proteus_meta = {
                     "FormatVersion": 1,
                     "Name": mod_name,
                     "Author": author,
                     "OptionGroups": option_groups_meta,
-                })
+                }
+                # A fresh export rebuilds this document from nothing, so the
+                # pack-level settings the /proteus editor owns — the Masks
+                # colorset and its render mode, the Skindent opt-in — have to
+                # be lifted off the previous copy explicitly.
+                n = _carry_unowned(proteus_meta, prior["top"], _METADATA_OWNED)
+                if n:
+                    self._log(f"  Carried {n} pack-level editor setting(s) forward")
+                _write_json(os.path.join(proteus_dir, "metadata.json"), proteus_meta)
 
                 # meta.json — one document carrying the default data and every
                 # group, in groups_order (array index = priority, lower first).
@@ -2802,6 +2836,56 @@ def _none_penumbra_option() -> dict:
             "Image": "", "Files": {}, "FileSwaps": {}, "Manipulations": []}
 
 
+# The keys the packager itself authors in Proteus/metadata.json. Everything
+# else in a document we are rebuilding was written by the in-game /proteus
+# editor — the render layer and shader, the scrolling glow and its speed and
+# tiling, the skin-tone mask, the Masks colorset, the Skindent opt-in — and is
+# carried forward untouched. A re-export from Substance Painter replaces
+# artwork and colorsets; it is not a statement about anything else.
+#
+# Deny-lists rather than allow-lists on purpose: a field Proteus gains later
+# survives a re-export without needing a change here.
+_OPTION_OWNED  = ("Name", "Overlays", "ColorTableRows")
+_OVERLAY_OWNED = ("MaterialGamePath", "Diffuse", "Normal", "Mask", "Index")
+# Top level. "Overlays" is owned-and-dropped rather than carried: a top-level
+# Overlays list makes Proteus ignore OptionGroups entirely (see
+# SidecarDiscoveryService.ResolveActiveOverlays), so carrying a stale one
+# forward would blank every option in the pack.
+_METADATA_OWNED = ("FormatVersion", "Name", "Author", "OptionGroups", "Overlays")
+
+
+def _carry_unowned(dst: dict, src: dict | None, owned: tuple) -> int:
+    """Copy every key of `src` the packager does not author into `dst`,
+    without overwriting anything already there. Returns how many were carried;
+    a missing/unusable `src` carries nothing."""
+    if not isinstance(src, dict) or not isinstance(dst, dict):
+        return 0
+    carried = 0
+    for key, value in src.items():
+        if key in owned or key in dst:
+            continue
+        dst[key] = value
+        carried += 1
+    return carried
+
+
+def _carry_option_settings(pro_entry: dict, prior: dict | None) -> int:
+    """Carry the editor-authored settings of a prior Proteus option onto the
+    freshly built one: the option's own extra keys, plus the extras of its
+    first overlay descriptor. The packager writes exactly one overlay per
+    option, so a hand-written multi-overlay option keeps only the first
+    descriptor's settings."""
+    if not isinstance(prior, dict):
+        return 0
+    carried = _carry_unowned(pro_entry, prior, _OPTION_OWNED)
+
+    overlays = pro_entry.get("Overlays") or []
+    prior_overlays = prior.get("Overlays") or []
+    if overlays and prior_overlays and isinstance(prior_overlays[0], dict):
+        carried += _carry_unowned(overlays[0], prior_overlays[0], _OVERLAY_OWNED)
+    return carried
+
+
 # Penumbra treats a mod with no Files / Swaps / Manipulations across the
 # default option and every group as "empty" and flags it as invalid. Proteus
 # does the real work from its own metadata.json, so the Penumbra shell carries
@@ -3818,28 +3902,43 @@ def _copy_mask_option(exported_files: list, proteus_dir: str, option: str,
     return True
 
 
-def _load_colorset_map(path: str, log=None) -> dict:
-    """Read an existing Proteus metadata.json and map its options'
-    ColorTableRows. Keyed by (group, name) and (None, name) so a lookup can
-    fall back to matching on option name alone."""
-    cmap: dict = {}
+def _load_prior_metadata(path: str, log=None) -> dict:
+    """Read an existing Proteus metadata.json and index it for reuse by a
+    rebuild: the whole document under "top", and each option dict under
+    "options", keyed by both (group, name) and (None, name) so a lookup can
+    fall back to matching on option name alone.
+
+    The options carry two things forward — their ColorTableRows (the colorset
+    reuse this has always done) and every editor-authored field the packager
+    does not itself write. See _OPTION_OWNED."""
+    prior: dict = {"top": {}, "options": {}}
     try:
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
     except Exception as exc:
         if log:
             log(f"[colorset] Could not read {path}: {exc}")
-        return cmap
+        return prior
+    if not isinstance(data, dict):
+        return prior
+
+    prior["top"] = data
+    opts = prior["options"]
     for og in data.get("OptionGroups", []):
         g = og.get("PenumbraGroupName")
         for o in og.get("Options", []):
-            rows = o.get("ColorTableRows")
             name = o.get("Name")
-            if rows is None or name is None:
+            if name is None:
                 continue
-            cmap[(g, name)] = rows
-            cmap.setdefault((None, name), rows)
-    return cmap
+            opts[(g, name)] = o
+            # The name-only fallback prefers an option that actually has a
+            # colorset, so a same-named but colorless option in some other
+            # group can't shadow the one worth reusing.
+            fallback = opts.get((None, name))
+            if fallback is None or (fallback.get("ColorTableRows") is None
+                                    and o.get("ColorTableRows") is not None):
+                opts[(None, name)] = o
+    return prior
 
 
 _PNG_SIG  = b"\x89PNG\r\n\x1a\n"
