@@ -665,8 +665,12 @@ class ProteusPackagerPlugin:
             return ""
         if not mod_name:
             return ""
-        penumbra_root = _read_penumbra_root_from_xivlauncher()
-        if not penumbra_root or not os.path.isdir(penumbra_root):
+        penumbra_root = _read_penumbra_root_from_xivlauncher(self._log)
+        if not penumbra_root:
+            return ""
+        if not os.path.isdir(penumbra_root):
+            self._log(f"Penumbra mod directory from config does not exist: "
+                      f"{penumbra_root}")
             return ""
         # Exact folder name first, then a case-insensitive match.
         candidates = [mod_name]
@@ -689,8 +693,12 @@ class ProteusPackagerPlugin:
         mod_name = (mod_name or "").strip()
         if not mod_name:
             return ""
-        penumbra_root = _read_penumbra_root_from_xivlauncher()
-        if not penumbra_root or not os.path.isdir(penumbra_root):
+        penumbra_root = _read_penumbra_root_from_xivlauncher(self._log)
+        if not penumbra_root:
+            return ""
+        if not os.path.isdir(penumbra_root):
+            self._log(f"Penumbra mod directory from config does not exist: "
+                      f"{penumbra_root}")
             return ""
         candidates = [mod_name]
         try:
@@ -2690,21 +2698,52 @@ def _reload_penumbra_mod(path: str, name: str = "", log=None) -> bool:
 
 def _read_penumbra_root_from_xivlauncher(log=None) -> str:
     """Return the `ModDirectory` value from XIVLauncher's Penumbra config, or
-    '' if anything fails. Mirrors Pickles-Playlist-Editor's GetPenumbraDirectory."""
+    '' if anything fails. Mirrors Pickles-Playlist-Editor's GetPenumbraDirectory.
+
+    Penumbra 1.7 moved the config from pluginConfigs/Penumbra.json to
+    pluginConfigs/Penumbra/config/penumbra.json (leaving the old file behind as
+    a .bak), so try the new location first and fall back to the legacy one.
+    Falling back is announced, because the pre-1.7 file keeps whatever path was
+    current at migration time and goes stale the moment Penumbra is pointed
+    somewhere else."""
     appdata = os.environ.get("APPDATA") or os.path.expandvars("%APPDATA%")
-    cfg_path = os.path.join(appdata, "XIVLauncher", "pluginConfigs", "Penumbra.json")
-    if not os.path.isfile(cfg_path):
-        if log:
-            log(f"Penumbra config not found: {cfg_path}")
-        return ""
-    try:
-        with open(cfg_path, encoding="utf-8") as f:
-            data = json.load(f)
-        return (data.get("ModDirectory") or "").strip()
-    except Exception as exc:
-        if log:
-            log(f"Could not read Penumbra config {cfg_path}: {exc}")
-        return ""
+    plugin_cfgs = os.path.join(appdata, "XIVLauncher", "pluginConfigs")
+    candidates = [
+        (os.path.join(plugin_cfgs, "Penumbra", "config", "penumbra.json"), False),
+        (os.path.join(plugin_cfgs, "Penumbra.json"), True),
+    ]
+    tried = []
+    parsed_any = False
+    for cfg_path, is_legacy in candidates:
+        if not os.path.isfile(cfg_path):
+            tried.append(f"{cfg_path} (missing)")
+            continue
+        try:
+            with open(cfg_path, encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                raise TypeError(
+                    f"expected a JSON object, got {type(data).__name__}")
+            parsed_any = True
+            root = data.get("ModDirectory")
+            root = root.strip() if isinstance(root, str) else ""
+            if root:
+                if is_legacy and log:
+                    log(f"Penumbra mod directory came from the pre-1.7 config "
+                        f"{cfg_path}: {root} — if Penumbra has since been "
+                        f"pointed at a different folder, this path is stale.")
+                return root
+            tried.append(f"{cfg_path} (no ModDirectory)")
+        except Exception as exc:
+            tried.append(f"{cfg_path} ({exc})")
+    if log:
+        if parsed_any:
+            log("Penumbra config has no ModDirectory set — is Penumbra "
+                "configured? Tried: " + ", ".join(tried))
+        else:
+            log("Penumbra config not found or unreadable; tried: "
+                + ", ".join(tried))
+    return ""
 
 
 # ── Misc helpers ──────────────────────────────────────────────────────────────
