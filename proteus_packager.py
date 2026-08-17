@@ -226,6 +226,9 @@ class ProteusPackagerPlugin:
         self._texture_format = "bc7"          # "bc7" (BC7 .dds) or "png"
         self._texconv_path = _texconv_default_path()
         self._export_resolution = 0           # px (4096/2048/…); 0 = document default
+        # Penumbra metadata format for NEW packs only (3 or 4); an update
+        # always keeps the format the existing pack is already in.
+        self._new_mod_meta_format = _META_FILE_VERSION
 
         self._load_settings()
         self._create_ui()
@@ -261,6 +264,14 @@ class ProteusPackagerPlugin:
             self._export_resolution = int(g.get("ExportResolution", "0") or "0")
         except ValueError:
             self._export_resolution = 0
+        try:
+            fmt = int(g.get("NewModMetaFormat", str(_META_FILE_VERSION))
+                      or _META_FILE_VERSION)
+        except ValueError:
+            fmt = _META_FILE_VERSION
+        self._new_mod_meta_format = (
+            fmt if fmt in (_META_FILE_VERSION_LEGACY, _META_FILE_VERSION)
+            else _META_FILE_VERSION)
 
         s = cfg["Suffixes"] if "Suffixes" in cfg else {}
         self._suffixes = {
@@ -291,6 +302,7 @@ class ProteusPackagerPlugin:
             "TextureFormat": self._texture_format,
             "TexConvPath": self._texconv_path,
             "ExportResolution": str(self._export_resolution),
+            "NewModMetaFormat": str(self._new_mod_meta_format),
         }
         cfg["Suffixes"] = {k: ",".join(v) for k, v in self._suffixes.items()}
         user_presets = {k: v.replace("\n", "\\n") for k, v in self._presets.items()
@@ -497,6 +509,33 @@ class ProteusPackagerPlugin:
         self._mutex_check.setChecked(self._mutually_exclusive)
         root.addWidget(self._mutex_check)
 
+        # Penumbra metadata format — new packs only. Updating an existing pack
+        # detects and keeps its format, so this can never convert one.
+        fmt_row = QtWidgets.QHBoxLayout()
+        fmt_row.addWidget(QtWidgets.QLabel("New mod format"))
+        self._meta_format_combo = QtWidgets.QComboBox()
+        self._meta_format_options = [
+            ("Penumbra v4 (single meta.json)", _META_FILE_VERSION),
+            ("Penumbra v3 (group_*.json)", _META_FILE_VERSION_LEGACY),
+        ]
+        for label, _fv in self._meta_format_options:
+            self._meta_format_combo.addItem(label)
+        _fmt_idx = next((i for i, (_l, fv) in enumerate(self._meta_format_options)
+                         if fv == self._new_mod_meta_format), 0)
+        self._meta_format_combo.setCurrentIndex(_fmt_idx)
+        self._meta_format_combo.setToolTip(
+            "Which Penumbra metadata layout a brand-new pack is written in. v4 "
+            "keeps everything in one meta.json; v3 writes the older "
+            "group_001_name.json + default_mod.json files, which older Penumbra "
+            "versions can still read.\n\n"
+            "Updating an existing pack ignores this — it is detected from the "
+            "pack and written back in its own format, so an update never "
+            "converts a mod."
+        )
+        fmt_row.addWidget(self._meta_format_combo)
+        fmt_row.addStretch(1)
+        root.addLayout(fmt_row)
+
         # BC7 DDS export toggle + texconv path. When checked, exported overlay/
         # mask channels are converted PNG→BC7 .dds (via texconv) to shrink the
         # pack; metadata overlay paths point at the .dds. Uncheck for raw PNG.
@@ -597,6 +636,7 @@ class ProteusPackagerPlugin:
         self._colorset_meta_edit.textEdited.connect(self._on_colorset_meta_edited)
         self._export_preset_combo.currentIndexChanged.connect(self._read_ui_settings)
         self._mutex_check.stateChanged.connect(self._read_ui_settings)
+        self._meta_format_combo.currentIndexChanged.connect(self._read_ui_settings)
         self._install_penumbra_check.stateChanged.connect(self._read_ui_settings)
         self._bc7_check.stateChanged.connect(self._read_ui_settings)
         self._texconv_edit.editingFinished.connect(self._read_ui_settings)
@@ -906,6 +946,8 @@ class ProteusPackagerPlugin:
         self._texture_format = "bc7" if self._bc7_check.isChecked() else "png"
         self._texconv_path = self._texconv_edit.text().strip()
         self._export_resolution = self._res_options[self._res_combo.currentIndex()][1]
+        self._new_mod_meta_format = self._meta_format_options[
+            self._meta_format_combo.currentIndex()][1]
         for key, edit in self._suffix_edits.items():
             self._suffixes[key] = _split_csv(edit.text())
         self._save_settings()
@@ -1080,6 +1122,9 @@ class ProteusPackagerPlugin:
             pmp_meta: dict = {}              # the pack's root meta.json (v4)
             grp_by_name: dict = {}           # group name -> Penumbra group dict
             superseded: list = []            # v3 files to delete after the write
+            # The format the pack is written back in. A merge keeps whatever
+            # the existing pack uses; a fresh export uses the dock's setting.
+            pack_fmt = self._new_mod_meta_format
             if merge:
                 pm_path = os.path.join(proteus_dir, "metadata.json")
                 if os.path.isfile(pm_path):
@@ -1094,11 +1139,46 @@ class ProteusPackagerPlugin:
                 proteus_meta.setdefault("OptionGroups", [])
                 for og in proteus_meta["OptionGroups"]:
                     pg_by_name[og.get("PenumbraGroupName")] = og
-                pmp_meta, superseded = _load_meta_json(pmp_root, mod_name, author)
+                # Detect before loading: _load_meta_json normalizes a v3 pack
+                # to the v4 shape in memory, which would hide what it came from.
+                pack_fmt = _detect_pack_format(pmp_root)
+                if pack_fmt == _META_FILE_VERSION_LEGACY:
+                    self._log("  Existing pack is Penumbra v3 (group_*.json) — "
+                              "updating it in that format")
+                pmp_meta, superseded = _load_meta_json(pmp_root, mod_name, author,
+                                                       self._log)
                 for gdata in pmp_meta["Groups"]:
                     gname = gdata.get("Name")
                     if gname is not None:
                         grp_by_name[gname] = gdata
+
+            # Refuse to build a multi-select group Penumbra cannot load, before
+            # a single texture is exported — the failure surfaces only in-game,
+            # as the whole mod disappearing, so it has to be caught here.
+            over_limit = []
+            for group in groups_order:
+                existing = grp_by_name.get(group) or {}
+                # An existing group keeps its own type; the dock's Single/Multi
+                # toggle only decides the type of groups being created.
+                gt = (existing.get("Type")
+                      or ("Multi" if _is_masks_group(group) else group_type))
+                if gt != "Multi":
+                    continue
+                names = {o.get("Name") for o in (existing.get("Options") or [])}
+                names |= set(structure[group])
+                if len(names) > _PENUMBRA_MULTI_OPTION_LIMIT:
+                    over_limit.append((group, len(names)))
+            if over_limit:
+                for gname, count in over_limit:
+                    self._log(
+                        f"Group '{gname}' would end up with {count} options, but "
+                        f"Penumbra allows at most {_PENUMBRA_MULTI_OPTION_LIMIT} "
+                        f"in a multi-select group — it would refuse to load the "
+                        f"whole mod. Make the group single-select, split it in "
+                        f"two, or drop "
+                        f"{count - _PENUMBRA_MULTI_OPTION_LIMIT} option(s).")
+                self._log("Export aborted — nothing was written.")
+                return
 
             for group in groups_order:
                 # A "Masks" group is a Penumbra-only multi-select group: it is
@@ -1123,10 +1203,13 @@ class ProteusPackagerPlugin:
                         pmp_meta["Groups"].append(gdata)
                         grp_by_name[group] = gdata
                     gdata.setdefault("Options", [])
+                    # An existing group keeps its own type, so the "None" rule
+                    # below has to follow that rather than the dock's toggle.
+                    gt = gdata.get("Type") or gt
 
                     proteus_opts = og["Options"] if og is not None else None
                     penumbra_opts = gdata["Options"]
-                    if not is_masks:
+                    if not is_masks and gt == "Single":
                         taken = {o.get("Name") for o in proteus_opts}
                         taken |= {o.get("Name") for o in penumbra_opts}
                         if "None" not in taken:
@@ -1291,7 +1374,10 @@ class ProteusPackagerPlugin:
                 if not merge and not is_masks:
                     option_groups_meta.append({
                         "PenumbraGroupName": group,
-                        "Options": [_none_proteus_option()] + proteus_opts,
+                        # Multi-select groups get no "None": deselecting every
+                        # option already means none, and the slot is not free.
+                        "Options": (proteus_opts if gt == "Multi"
+                                    else [_none_proteus_option()] + proteus_opts),
                     })
 
             if mask_threads:
@@ -1307,11 +1393,14 @@ class ProteusPackagerPlugin:
                 # didn't touch (Identifier, ModTags, Image…) is preserved by
                 # having loaded and rewritten the whole document.
                 _write_json(os.path.join(proteus_dir, "metadata.json"), proteus_meta)
-                _ensure_default_data_has_content(pmp_meta)
-                _write_json(os.path.join(pmp_root, "meta.json"), pmp_meta)
+                written = _write_pack_meta(pmp_root, pmp_meta, pack_fmt, self._log)
                 # Only now is it safe to drop the v3 files we folded in: until
                 # the write above landed they were the only copy of the groups.
-                _clean_legacy_files(superseded, self._log)
+                # Writing v3 back rewrites those same paths, so anything just
+                # written has to survive this sweep.
+                _clean_legacy_files(
+                    [p for p in superseded if _pathkey(p) not in written],
+                    self._log)
 
                 if folder_target:
                     # Already writing directly into the live install — no
@@ -1364,19 +1453,23 @@ class ProteusPackagerPlugin:
                          "Files": {}, "FileSwaps": {}, "Manipulations": []}
                         for o in structure[group]]
                     gdata = _new_penumbra_group(group, gt)
-                    # Masks are always multi-select with no "None" option.
-                    gdata["Options"] = (base_opts if is_masks
+                    # No "None" in a multi-select group (masks included):
+                    # deselecting everything already means none, and the slot
+                    # counts against Penumbra's 32-option limit.
+                    gdata["Options"] = (base_opts if gt == "Multi"
                                         else [_none_penumbra_option()] + base_opts)
                     pmp_meta["Groups"].append(gdata)
-                _write_json(os.path.join(pmp_root, "meta.json"), pmp_meta)
-                # Drop any v3 files left over from an older export into this
-                # same folder; Penumbra ignores them, but a stale group_*.json
-                # beside a live meta.json reads like current state.
-                stale = [str(p) for p in Path(pmp_root).glob("group_*.json")]
-                dm = os.path.join(pmp_root, "default_mod.json")
-                if os.path.isfile(dm):
-                    stale.append(dm)
-                _clean_legacy_files(stale, self._log)
+                # Writes in the dock's chosen format and drops whatever the
+                # other format left in this folder from an earlier export:
+                # Penumbra ignores the wrong-format files, but a stale
+                # group_*.json beside a live meta.json reads like current state.
+                _write_pack_meta(pmp_root, pmp_meta, pack_fmt, self._log)
+                if pack_fmt == _META_FILE_VERSION_LEGACY:
+                    self._log("  Wrote Penumbra v3 format (group_*.json + "
+                              "default_mod.json)")
+                    if self._install_to_penumbra:
+                        self._log("  Note: Penumbra migrates the installed copy "
+                                  "to v4 on load — v3 is what the .pmp ships as")
 
                 if self._install_to_penumbra:
                     penumbra_root = _read_penumbra_root_from_xivlauncher(self._log)
@@ -2938,14 +3031,59 @@ _DUMMY_SWAP_PATH = (
 # Penumbra's on-disk mod format. Since FileVersion 4 the whole layout lives in
 # one root meta.json: option groups moved out of group_NNN_name.json files into
 # a "Groups" array (order = array index), and default_mod.json became the
-# "DefaultData" object. Older packs are migrated on load, see _load_meta_json.
+# "DefaultData" object.
+#
+# A pack is always loaded as v4 (see _load_meta_json) so the merge code only
+# deals with one shape, but it is written back in whatever format it arrived in
+# (see _detect_pack_format / _write_pack_meta). Most published .pmp archives out
+# there are still v3, and silently converting one on update would make it
+# unreadable to anyone on a Penumbra older than the v4 switch.
 _META_FILE_VERSION = 4
+_META_FILE_VERSION_LEGACY = 3
+
+# Penumbra keeps a multi-select group's selection in a 32-bit mask, so such a
+# group cannot hold more than 32 options. A 33rd doesn't degrade gracefully:
+# Penumbra refuses the ENTIRE mod on load with "New Object expected." and it
+# vanishes from the mod list, with nothing pointing at the group that caused
+# it. Measured against Penumbra 1.7 — 32 loads, 33 does not. Single-select
+# groups have no such limit (40+ options load fine).
+_PENUMBRA_MULTI_OPTION_LIMIT = 32
 
 
 def _default_data_with_dummy() -> dict:
     return {"Files": {},
             "FileSwaps": {_DUMMY_SWAP_PATH: _DUMMY_SWAP_PATH},
             "Manipulations": []}
+
+
+def _detect_pack_format(pmp_root: str, default: int = _META_FILE_VERSION) -> int:
+    """Which on-disk format the pack at pmp_root is written in: 3 or 4.
+
+    The declared FileVersion wins; the layout on disk only breaks ties. A mod
+    with no option groups is a v4 meta.json with neither "Groups" nor any
+    group_*.json beside it, so structure alone would read it as v3."""
+    meta = None
+    try:
+        with open(os.path.join(pmp_root, "meta.json"), encoding="utf-8") as f:
+            meta = json.load(f)
+    except (OSError, ValueError):
+        meta = None
+
+    if isinstance(meta, dict):
+        fv = meta.get("FileVersion")
+        # bool is an int subclass; a "FileVersion": true would sneak through.
+        if isinstance(fv, int) and not isinstance(fv, bool):
+            if fv >= _META_FILE_VERSION:
+                return _META_FILE_VERSION
+            if fv == _META_FILE_VERSION_LEGACY:
+                return _META_FILE_VERSION_LEGACY
+        if isinstance(meta.get("Groups"), list) or isinstance(meta.get("DefaultData"), dict):
+            return _META_FILE_VERSION
+
+    if (os.path.isfile(os.path.join(pmp_root, "default_mod.json"))
+            or any(Path(pmp_root).glob("group_*.json"))):
+        return _META_FILE_VERSION_LEGACY
+    return default
 
 
 def _existing_identifier(pmp_root: str):
@@ -2991,7 +3129,8 @@ def _ensure_default_data_has_content(meta: dict) -> None:
     meta["DefaultData"] = _default_data_with_dummy()
 
 
-def _load_meta_json(pmp_root: str, mod_name: str, author: str) -> tuple[dict, list]:
+def _load_meta_json(pmp_root: str, mod_name: str, author: str,
+                    log=None) -> tuple[dict, list]:
     """Read the pack's root meta.json as FileVersion 4, folding a v3 layout
     (separate group_*.json files + default_mod.json) into it so merge mode only
     ever deals with one shape.
@@ -3004,14 +3143,28 @@ def _load_meta_json(pmp_root: str, mod_name: str, author: str) -> tuple[dict, li
     path = os.path.join(pmp_root, "meta.json")
     superseded: list = []
     meta = None
+    err = None
     if os.path.isfile(path):
         try:
             with open(path, encoding="utf-8") as f:
                 meta = json.load(f)
-        except Exception:
-            meta = None
+        except Exception as exc:
+            meta, err = None, exc
     if not isinstance(meta, dict):
-        return _new_meta_json(mod_name, author), superseded
+        # An unreadable meta.json must not take the rest of the pack with it:
+        # in a v3 layout the group_*.json files beside it are the only copy of
+        # every option, and carrying on with a blank document would rewrite the
+        # pack from this export alone — and then sweep the group files it no
+        # longer knows about. Rebuild just the header and let the migration
+        # below recover the groups and the default data from disk.
+        if err is not None and log:
+            log(f"  Existing meta.json could not be read ({err}) — rebuilding it "
+                f"and recovering the option groups from the pack's own files")
+        meta = _new_meta_json(mod_name, author)
+        # Both are re-derived below; leaving the placeholders in would make the
+        # migration branches think there is nothing to recover.
+        meta.pop("Groups", None)
+        meta.pop("DefaultData", None)
 
     meta.setdefault("Identifier", str(uuid.uuid4()))
     meta.setdefault("Name", mod_name)
@@ -3050,7 +3203,8 @@ def _load_meta_json(pmp_root: str, mod_name: str, author: str) -> tuple[dict, li
                 with open(dm_path, encoding="utf-8") as f:
                     dm = json.load(f)
                 if isinstance(dm, dict):
-                    # v3 called it "Swaps"; v4 calls it "FileSwaps".
+                    # Both formats spell it "FileSwaps"; "Swaps" is only a
+                    # defensive fallback for hand-written packs.
                     dd = {"Files": dm.get("Files") or {},
                           "FileSwaps": dm.get("FileSwaps") or dm.get("Swaps") or {},
                           "Manipulations": dm.get("Manipulations") or []}
@@ -3059,7 +3213,8 @@ def _load_meta_json(pmp_root: str, mod_name: str, author: str) -> tuple[dict, li
             superseded.append(dm_path)
         meta["DefaultData"] = dd or _default_data_with_dummy()
 
-    meta["FileVersion"] = _META_FILE_VERSION
+    # FileVersion is deliberately left as-is: _write_pack_meta owns it, and it
+    # is what tells a v4 write whether the document is actually newer than 4.
     return meta, superseded
 
 
@@ -3072,6 +3227,98 @@ def _clean_legacy_files(paths: list, log=None) -> None:
         except OSError as e:
             if log:
                 log(f"  Could not remove superseded {os.path.basename(p)}: {e}")
+
+
+def _meta_v3_documents(meta: dict) -> tuple[dict, dict, list]:
+    """Split a v4 in-memory document back into the three v3 documents:
+    (meta.json, default_mod.json, [(group filename, group doc), …]).
+
+    Pure — does no I/O, so the shape can be checked without writing a pack.
+    v3 has no Ids (they arrived with v4) and carries the group ordering in the
+    filename number rather than the array index, so both are translated here."""
+    meta_doc = {k: v for k, v in meta.items() if k not in ("Groups", "DefaultData")}
+    meta_doc["FileVersion"] = _META_FILE_VERSION_LEGACY
+
+    dd = meta.get("DefaultData")
+    default_doc = {"Version": 0}
+    # Keep whatever else the pack's default container carried (TexTools writes
+    # Name/Priority/Description/Image); only the three payload keys are ours.
+    if isinstance(dd, dict):
+        default_doc.update({k: v for k, v in dd.items() if k != "Version"})
+    default_doc.setdefault("Files", {})
+    default_doc.setdefault("FileSwaps", {})
+    default_doc.setdefault("Manipulations", [])
+
+    groups: list = []
+    for i, gdata in enumerate(meta.get("Groups") or []):
+        if not isinstance(gdata, dict):
+            continue
+        gdoc = {k: v for k, v in gdata.items() if k not in ("Id", "Options")}
+        gdoc["Version"] = 0
+        gdoc.setdefault("Priority", 0)
+        gtype = gdoc.get("Type", "Single")
+        opts = []
+        for o in gdata.get("Options") or []:
+            if not isinstance(o, dict):
+                continue
+            odoc = {k: v for k, v in o.items() if k != "Id"}
+            # In a Multi group each option carries its own priority; Single
+            # groups pick exactly one option, so there is nothing to order.
+            if gtype == "Multi":
+                odoc.setdefault("Priority", 0)
+            else:
+                odoc.pop("Priority", None)
+            opts.append(odoc)
+        gdoc["Options"] = opts
+        name = _safe_path_component(str(gdoc.get("Name") or "group")).lower()
+        groups.append((f"group_{i + 1:03d}_{name}.json", gdoc))
+    return meta_doc, default_doc, groups
+
+
+def _pathkey(path) -> str:
+    """A path in the one spelling comparisons can rely on. os.path.join and
+    Path.glob disagree about separators and case for the same file on Windows,
+    and a mismatch here would delete a file we just wrote."""
+    return os.path.normcase(os.path.abspath(str(path)))
+
+
+def _write_pack_meta(pmp_root: str, meta: dict, fmt: int, log=None) -> set:
+    """Write the pack's metadata in format `fmt` (3 or 4) from the v4 in-memory
+    document, and remove whatever files the other format left behind. Returns
+    the _pathkey set of the files written, so a caller holding a list of
+    superseded legacy paths knows which of them it must NOT delete."""
+    _ensure_default_data_has_content(meta)
+    meta_path = os.path.join(pmp_root, "meta.json")
+
+    if fmt == _META_FILE_VERSION_LEGACY:
+        meta_doc, default_doc, groups = _meta_v3_documents(meta)
+        dm_path = os.path.join(pmp_root, "default_mod.json")
+        written = {_pathkey(meta_path), _pathkey(dm_path)}
+        _write_json(meta_path, meta_doc)
+        _write_json(dm_path, default_doc)
+        for fname, gdoc in groups:
+            gpath = os.path.join(pmp_root, fname)
+            _write_json(gpath, gdoc)
+            written.add(_pathkey(gpath))
+        # A renamed, removed or reordered group leaves its old file behind, and
+        # Penumbra reads every group_*.json it finds — so sweep the strays.
+        stale = [str(p) for p in Path(pmp_root).glob("group_*.json")
+                 if _pathkey(p) not in written]
+        _clean_legacy_files(stale, log)
+        return written
+
+    # v4: one document. Never downgrade a pack that declares something newer —
+    # its extra structures survive because the whole document is rewritten.
+    fv = meta.get("FileVersion")
+    meta["FileVersion"] = (fv if isinstance(fv, int) and not isinstance(fv, bool)
+                           and fv > _META_FILE_VERSION else _META_FILE_VERSION)
+    _write_json(meta_path, meta)
+    stale = [str(p) for p in Path(pmp_root).glob("group_*.json")]
+    dm = os.path.join(pmp_root, "default_mod.json")
+    if os.path.isfile(dm):
+        stale.append(dm)
+    _clean_legacy_files(stale, log)
+    return {_pathkey(meta_path)}
 
 
 _FS_UNSAFE = re.compile(r'[<>:"/\\|?*]+')
