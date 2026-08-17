@@ -102,6 +102,7 @@ The Masks group differs from normal groups:
 | **Preset / Load** | Quick-load a saved set of material paths. Ships with a **Bibo+** preset. |
 | **Suffix mappings** | How exported filenames map to overlay types. Comma-separated, longest match wins. |
 | **Mutually exclusive options** | Checked → Penumbra group type `Single`; unchecked → `Multi`. |
+| **New mod format** | Which Penumbra metadata layout a **brand-new** pack is written in — `v4` (single `meta.json`, the default) or `v3` (legacy `group_*.json` + `default_mod.json`). Updating an existing pack ignores this setting; see [Penumbra metadata format](#penumbra-metadata-format). |
 | **Generate previews** | Manual button. Iterates every option, force-shows its Colorset sub-folder layers, switches SP to 3D-only view, screenshots the viewport, and saves into `<OutputDir>/<ModName>/<group>/<option>.png` plus a near-square `<ModName>_preview.png` index grid. The next **Export PMP** picks these up automatically — see [Preview images in the pack](#preview-images-in-the-pack). Layer visibility (and the colorset-layer hide rule used by **Export PMP**) are restored when done. |
 | **Export PMP** | Manual trigger. |
 
@@ -168,10 +169,7 @@ Colorset layers are **hidden automatically during that option's texture export**
 
 ```
 MyMod.pmp  (renamed .zip)
-├── meta.json
-├── default_mod.json
-├── group_001_style.json
-├── group_002_masks.json   ← Masks group (Type: Multi, options by name)
+├── meta.json              ← v4: also holds DefaultData + the Groups array
 └── Proteus/
     ├── metadata.json
     ├── Style/
@@ -184,11 +182,31 @@ MyMod.pmp  (renamed .zip)
     │       ├── diffuse.png
     │       └── normal.png
     └── Masks/              ← flat RGBA mask files, NOT referenced by metadata.json
-        ├── Stirrups.png    ← matches the "Stirrups" option in group_002_masks.json
+        ├── Stirrups.png    ← matches the "Stirrups" option in the Masks group
         └── Socks.png
 ```
 
-The **Masks** group appears only as its Penumbra group file plus flat `Proteus/Masks/<Option>.png` files — there is no entry for it in `Proteus/metadata.json`. The runtime maps a selected mask option to its file purely by name, reading the alpha channel as the apply region and the RGB as the mask value.
+The **Masks** group appears only as its Penumbra group entry plus flat `Proteus/Masks/<Option>.png` files — there is no entry for it in `Proteus/metadata.json`. The runtime maps a selected mask option to its file purely by name, reading the alpha channel as the apply region and the RGB as the mask value.
+
+### Penumbra metadata format
+
+Penumbra has two on-disk layouts for the mod shell, and the packager reads and
+writes both:
+
+| | v4 (current) | v3 (legacy) |
+|---|---|---|
+| Option groups | `meta.json` → `Groups` array (order = array index) | one `group_001_style.json` per group (order = filename number) |
+| Default data | `meta.json` → `DefaultData` | `default_mod.json` |
+| Group/option `Id` | GUID on every group and option | none |
+
+- **Updating an existing pack keeps that pack's format.** The format is detected
+  from the pack itself (`FileVersion`, falling back to what's on disk), so a v3
+  modpack stays v3 after an update and remains readable by older Penumbra
+  versions. Nothing the packager does converts a pack between formats.
+- **New packs** use the **New mod format** dropdown — v4 by default.
+- Note that Penumbra migrates any v3 mod it *installs* to v4 on load (leaving
+  `.bak` files beside it), so the choice really governs what your distributed
+  `.pmp` contains.
 
 Every exported PNG receives a small `tEXt` chunk stamped with its option's path (e.g. `Style/Roses`). Penumbra auto-deduplicates identical files, which would otherwise collapse pixel-identical index/mask textures across options into a single file and break per-option overlays. The stamp keeps the pixel data identical but the file bytes distinct, so Penumbra leaves each option's textures alone.
 
@@ -208,7 +226,7 @@ MyMod.pmp
         └── Dots.png
 ```
 
-Each Penumbra option's `Image` field in `group_NNN_*.json` is filled in with the matching `images/<Group>/<Option>.png` relative path, so Penumbra's option list shows the screenshot next to each name. Options without a preview on disk get an empty `Image` (Penumbra falls back to a generic icon). Re-run **Generate previews** after renaming or adding options so the bundled images stay in sync.
+Each Penumbra option's `Image` field is filled in with the matching `images/<Group>/<Option>.png` relative path, so Penumbra's option list shows the screenshot next to each name. Options without a preview on disk get an empty `Image` (Penumbra falls back to a generic icon). Re-run **Generate previews** after renaming or adding options so the bundled images stay in sync.
 
 ---
 
@@ -218,13 +236,15 @@ Set the **Existing PMP** field to fold a fresh export into a modpack you
 already have instead of producing a standalone pack:
 
 - The selected `.pmp` is **overwritten in place** (the Output Dir is ignored).
-- Everything already in the pack is preserved — existing `group_*.json`,
-  `default_mod.json`, and any existing `Proteus/` options stay intact.
+- Everything already in the pack is preserved — its existing groups, default
+  data, and any existing `Proteus/` options stay intact.
+- The pack keeps its [metadata format](#penumbra-metadata-format): a v3 pack is
+  written back as v3, a v4 pack as v4.
 - The pack's `Name`/`Author` (from its `meta.json`) are kept, so Penumbra
   treats it as the same mod being updated.
-- New options are appended to the matching group, creating the group's
-  `group_NNN_*.json` and/or `Proteus/metadata.json` if the pack doesn't
-  have them yet (works on a plain non-Proteus Penumbra pack too).
+- New options are appended to the matching group, creating the group and/or
+  `Proteus/metadata.json` if the pack doesn't have them yet (works on a plain
+  non-Proteus Penumbra pack too).
 - If the pack already has an option with the same name in that group, the
   existing option is **replaced** — its textures and metadata entry are
   overwritten with the freshly exported version (stale texture files for that
