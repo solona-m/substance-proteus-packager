@@ -151,6 +151,8 @@ _MASK_SEAM_SRC_DEPTH_PX    =  3  # when filling across a UV seam, sample the
 # Only diffuse tolerates lossy BC7. Normals use BC5 (the 2-channel normal
 # format). Index/Mask carry discrete/coverage values Proteus reads literally,
 # so any lossy block compression corrupts them — they stay lossless PNG.
+# A Diffuse with any opacity below 100% also stays PNG; that is decided per
+# file at export time (see _png_has_translucency).
 _COMPRESS_FORMAT = {
     "Diffuse": "BC7_UNORM",   # perceptual color — BC7 is made for this
     "Normal":  "BC5_UNORM",   # 2-channel normal format; BC7 mangles normals
@@ -545,8 +547,9 @@ class ProteusPackagerPlugin:
             "Compress each exported channel with the format that suits it, using "
             "texconv (auto-downloaded from Microsoft on plugin update): diffuse "
             "→ BC7, normal → BC5. Index and masks stay lossless PNG — they carry "
-            "discrete/coverage values that lossy block compression corrupts. Much "
-            "smaller packs. Uncheck to ship plain PNGs like before."
+            "discrete/coverage values that lossy block compression corrupts — and "
+            "so does a diffuse with any opacity below 100%. Much smaller packs. "
+            "Uncheck to ship plain PNGs like before."
         )
         root.addWidget(self._bc7_check)
 
@@ -1305,6 +1308,14 @@ class ProteusPackagerPlugin:
                         dst_png = os.path.join(abs_subdir, fname)
                         _png_copy_stamped(fpath, dst_png, rel_subdir)
                         fmt = _COMPRESS_FORMAT.get(tex_type)
+                        # A diffuse with any opacity below 100% stays PNG:
+                        # BC7 quantises the alpha per block, which bands soft
+                        # translucency and fringes the coverage edge.
+                        if (bc7_texconv and fmt and tex_type == "Diffuse"
+                                and _png_has_translucency(dst_png, self._log)):
+                            self._log(f"  Diffuse has opacity < 100% — "
+                                      f"keeping PNG: {rel_subdir}/{fname}")
+                            fmt = None
                         if bc7_texconv and fmt:
                             dds = _to_bc7_dds(dst_png, bc7_texconv, fmt=fmt,
                                               label=f"{rel_subdir}/{fname}",
@@ -3373,6 +3384,27 @@ def _png_has_alpha(path: str) -> bool:
     if not head.startswith(_PNG_SIG) or len(head) < 26:
         return False
     return head[25] in (4, 6)
+
+
+def _png_has_translucency(path: str, log=None) -> bool:
+    """True if any pixel of the PNG is less than fully opaque (alpha < 255).
+    A PNG with no alpha channel is opaque by definition (header check only, no
+    decode). An alpha-bearing PNG that can't be decoded counts as translucent,
+    so the caller errs toward keeping it lossless."""
+    if not _png_has_alpha(path):
+        return False
+    try:
+        from PIL import Image as _PILImage
+        with _PILImage.open(path) as img:
+            return img.convert("RGBA").getchannel("A").getextrema()[0] < 255
+    except ImportError:
+        pass
+    except Exception:
+        pass  # fall through to the pure-Python decoder
+    px, _w, _h = _png_decode_rgba(path, log)
+    if px is None:
+        return True
+    return min(px[3::4], default=255) < 255
 
 
 def _pick_mask_image(exported_files: list) -> str:
